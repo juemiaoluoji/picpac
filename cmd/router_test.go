@@ -135,6 +135,13 @@ func (s *fakeChecklistService) DeleteChecklist(_ context.Context, _ string, _ st
 
 type fakeAuthService struct{}
 
+type fakeLaunchScreenService struct{}
+
+// Get returns a disabled launch screen for route tests.
+func (s *fakeLaunchScreenService) Get(_ context.Context) (*domain.LaunchScreen, error) {
+	return &domain.LaunchScreen{}, nil
+}
+
 func (s *fakeAuthService) SendPhoneCode(_ context.Context, _ request.SendPhoneCodeInput) error {
 	return nil
 }
@@ -208,7 +215,7 @@ func TestRegisterAPIRoutesExposesEndpoints(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	registerAPIRoutes(router, &fakeItemService{}, &fakePackService{}, &fakeChecklistService{}, &fakeCategoryService{}, &fakeAISuggestionService{}, &fakeAuthService{}, &fakeTokenService{}, &fakeObjectURLSigner{})
+	registerAPIRoutes(router, &fakeItemService{}, &fakePackService{}, &fakeChecklistService{}, &fakeCategoryService{}, &fakeLaunchScreenService{}, &fakeAISuggestionService{}, &fakeAuthService{}, &fakeTokenService{}, &fakeObjectURLSigner{})
 
 	tests := []struct {
 		method string
@@ -223,6 +230,7 @@ func TestRegisterAPIRoutesExposesEndpoints(t *testing.T) {
 		{method: http.MethodPut, path: "/api/v1/item/" + bson.NewObjectID().Hex()},
 		{method: http.MethodDelete, path: "/api/v1/item/" + bson.NewObjectID().Hex()},
 		{method: http.MethodGet, path: "/api/v1/categories"},
+		{method: http.MethodGet, path: "/api/v1/app/launch-screen"},
 		{method: http.MethodPost, path: "/api/v1/pack"},
 		{method: http.MethodGet, path: "/api/v1/pack"},
 		{method: http.MethodGet, path: "/api/v1/pack/" + bson.NewObjectID().Hex()},
@@ -269,7 +277,7 @@ func TestRegisterAPIRoutesDoesNotExposeLegacyPackUpdate(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	registerAPIRoutes(router, &fakeItemService{}, &fakePackService{}, &fakeChecklistService{}, &fakeCategoryService{}, &fakeAISuggestionService{}, &fakeAuthService{}, &fakeTokenService{}, &fakeObjectURLSigner{})
+	registerAPIRoutes(router, &fakeItemService{}, &fakePackService{}, &fakeChecklistService{}, &fakeCategoryService{}, &fakeLaunchScreenService{}, &fakeAISuggestionService{}, &fakeAuthService{}, &fakeTokenService{}, &fakeObjectURLSigner{})
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/pack/"+bson.NewObjectID().Hex(), bytes.NewBuffer(nil))
 	recorder := httptest.NewRecorder()

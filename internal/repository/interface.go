@@ -17,6 +17,11 @@ type CategoryRepository interface {
 	UpsertByKey(ctx context.Context, category *domain.Category) error
 }
 
+// LaunchScreenRepository defines persistence behavior for launch screen configuration.
+type LaunchScreenRepository interface {
+	GetActive(ctx context.Context) (*domain.LaunchScreen, error)
+}
+
 // ItemRepository defines persistence behavior for items.
 type ItemRepository interface {
 	Create(ctx context.Context, item *domain.Item) error
