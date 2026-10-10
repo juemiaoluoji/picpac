@@ -546,6 +546,59 @@ curl -X PATCH 'http://localhost:9090/api/v1/me/profile' \
 
 存储采用字段级更新，不会用旧 User 文档覆盖其他字段；同一字段并发修改以后写入为准。头像路径保持不变，OSS 和 MongoDB 不存在跨系统事务：上传覆盖成功后数据库失败，或原图上传后展示图上传失败，已有云端对象可能已经变化。该版本不新增头像删除、默认头像恢复或旧对象清理。
 
+### Launch Screen
+
+`GET /api/v1/app/launch-screen`
+
+获取当前启动页配置。该接口不要求登录，App 启动时调用。后端从 MongoDB 读取当前配置，并为 OSS 媒体生成临时 signed URL；响应不会暴露 OSS object key。
+
+成功响应：
+
+```json
+{
+  "enabled": true,
+  "revision": "2026-10-08",
+  "type": "image",
+  "media_url": "https://picpac.oss-cn-shanghai.aliyuncs.com/app/launch-screen/v1/image.webp?Expires=...&Signature=...",
+  "poster_url": "",
+  "duration_ms": 2500,
+  "skip_enabled": true
+}
+```
+
+响应字段：
+
+- `enabled`: 是否显示启动页。
+- `revision`: 启动页配置修订号，格式为 `YYYY-MM-DD`；同一天第二次发布可使用 `YYYY-MM-DD-02`。客户端可以用它判断本地缓存是否需要更新。
+- `type`: `image` 或 `video`。
+- `media_url`: 图片或视频的临时 signed URL。
+- `poster_url`: 视频开始播放前显示的封面 URL；`image` 类型为空字符串。
+- `duration_ms`: 建议展示时长，单位毫秒。
+- `skip_enabled`: 是否允许用户跳过。
+
+视频响应的 `type` 为 `video`，`media_url` 指向视频，`poster_url` 指向视频封面。图片响应的 `media_url` 指向图片，`poster_url` 为空。
+
+没有启用配置时仍返回 `200`：
+
+```json
+{
+  "enabled": false,
+  "revision": "",
+  "type": "",
+  "media_url": "",
+  "poster_url": "",
+  "duration_ms": 0,
+  "skip_enabled": true
+}
+```
+
+前端在请求失败或 `enabled=false` 时使用内置默认图片。响应带有 `Cache-Control: no-cache`；媒体资源应使用与 `revision` 对齐的 OSS 路径，例如 `app/launch-screen/2026-10-08/image.webp`、`app/launch-screen/2026-10-08-02/video.mp4` 和 `app/launch-screen/2026-10-08-02/poster.webp`。第一版不支持 `starts_at`、`ends_at` 或公开配置修改接口，当前配置通过 `launch_screen_configs` 集合维护。MongoDB 文档使用 Repository 定义的 BSON 字段名：`ena`、`rev`、`typ`、`mk`、`pk`、`dur`、`skip`、`uat`。
+
+失败响应：
+
+- `500`: 查询启动页配置失败。
+- `500`: 生成 OSS signed URL 失败或配置内容非法。
+
 ### List Categories
 
 `GET /api/v1/categories`

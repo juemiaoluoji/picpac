@@ -30,6 +30,7 @@ func newRouter(cfg *config.Configuration, bucket *oss.Bucket, db *mongo.Database
 	packRepo := mongodb.NewPackRepository(db)
 	checklistRepo := mongodb.NewChecklistRepository(db)
 	categoryRepo := mongodb.NewCategoryRepository(db)
+	launchScreenRepo := mongodb.NewLaunchScreenRepository(db)
 	userRepo := mongodb.NewUserRepository(db)
 	authIdentityRepo := mongodb.NewAuthIdentityRepository(db)
 	refreshTokenRepo := mongodb.NewRefreshTokenRepository(db)
@@ -37,6 +38,7 @@ func newRouter(cfg *config.Configuration, bucket *oss.Bucket, db *mongo.Database
 	uploadService := service.NewOSSUploadService(bucket, cfg.OSS.SignedURLTTLSeconds)
 	tokenService := service.NewTokenService(cfg.Auth.AccessTokenSecret, time.Duration(cfg.Auth.AccessTokenTTLSeconds)*time.Second)
 	categoryService := service.NewCategoryService(categoryRepo)
+	launchScreenService := service.NewLaunchScreenService(launchScreenRepo, uploadService)
 	itemService := service.NewItemService(itemRepo, uploadService, categoryService)
 	packService := service.NewPackService(packRepo, itemRepo)
 	checklistService := service.NewChecklistService(checklistRepo, itemRepo)
@@ -46,7 +48,7 @@ func newRouter(cfg *config.Configuration, bucket *oss.Bucket, db *mongo.Database
 	itemDraftExtractionAgent := agent.NewChatItemDraftExtractionAgent(chatClient)
 	aiSuggestionService := service.NewAISuggestionService(itemService, categoryService, recommendationAgent, itemDraftExtractionAgent)
 
-	registerAPIRoutes(router, itemService, packService, checklistService, categoryService, aiSuggestionService, authService, tokenService, uploadService, cfg.Auth.ProfileUpload)
+	registerAPIRoutes(router, itemService, packService, checklistService, categoryService, launchScreenService, aiSuggestionService, authService, tokenService, uploadService, cfg.Auth.ProfileUpload)
 
 	return router, nil
 }
@@ -61,16 +63,18 @@ func newPhoneVerificationService(cfg *config.Configuration) (service.PhoneVerifi
 	return service.NewAliyunPhoneVerificationService(cfg.Auth.PhoneCode)
 }
 
-func registerAPIRoutes(router *gin.Engine, itemService service.ItemService, packService service.PackService, checklistService service.ChecklistService, categoryService service.CategoryService, aiSuggestionService service.AISuggestionService, authService service.AuthService, tokenService service.TokenService, objectURLSigner service.ObjectURLSigner, profileLimits ...config.ProfileUploadConfig) {
+func registerAPIRoutes(router *gin.Engine, itemService service.ItemService, packService service.PackService, checklistService service.ChecklistService, categoryService service.CategoryService, launchScreenService service.LaunchScreenService, aiSuggestionService service.AISuggestionService, authService service.AuthService, tokenService service.TokenService, objectURLSigner service.ObjectURLSigner, profileLimits ...config.ProfileUploadConfig) {
 	itemHandler := handler.NewItemHandler(itemService, categoryService, objectURLSigner)
 	packHandler := handler.NewPackHandler(packService)
 	checklistHandler := handler.NewChecklistHandler(checklistService)
 	categoryHandler := handler.NewCategoryHandler(categoryService)
 	aiHandler := handler.NewAIHandler(aiSuggestionService)
+	launchScreenHandler := handler.NewLaunchScreenHandler(launchScreenService)
 	authHandler := handler.NewAuthHandler(authService, objectURLSigner, profileLimits...)
 	authMiddleware := handler.NewAuthMiddleware(tokenService, authService)
 
 	router.GET("/api/v1/categories", categoryHandler.ListCategories)
+	router.GET("/api/v1/app/launch-screen", launchScreenHandler.Get)
 
 	authRoutes := router.Group("/api/v1/auth")
 	authRoutes.POST("/phone/code", authHandler.SendPhoneCode)
