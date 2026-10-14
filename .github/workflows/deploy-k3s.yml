@@ -163,7 +163,7 @@ jobs:
           PY
           chmod 600 "$ssh_dir/tcr.json"
           chmod 600 "$ssh_dir/config.json"
-          scp "${ssh_options[@]}" -P "$SSH_PORT" deploy/deploy-k3s.sh deploy/picpac.yaml "$ssh_dir/tcr.json" "$ssh_dir/config.json" "$target:$remote_dir/"
+          scp "${ssh_options[@]}" -P "$SSH_PORT" deploy/deploy-k3s.sh deploy/prepare-config.py deploy/picpac.yaml "$ssh_dir/tcr.json" "$ssh_dir/config.json" "$target:$remote_dir/"
           printf -v command 'sudo -n -i bash %q %q %q %q %q %q %q %q %q' \
             "$remote_dir/deploy-k3s.sh" "$IMAGE" "$CONFIG_PATH" "$PLATFORM" "$NODE_PORT" "$remote_dir/tcr.json" "$remote_dir/picpac.yaml" "$remote_dir/config.json" "$MONGO_NODE_PORT"
           ssh "${ssh_options[@]}" -p "$SSH_PORT" "$target" "$command"

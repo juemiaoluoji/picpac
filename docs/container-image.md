@@ -25,7 +25,7 @@
 | Variable | `TCR_IMAGE` | 完整仓库路径，不带协议和标签，当前为 `ccr.ccs.tencentyun.com/picpac/server` |
 | Secret | `TCR_USERNAME` | TCR 登录指引中的账号 ID |
 | Secret | `TCR_PASSWORD` | TCR 个人版访问密码 |
-| Secret | `PICPAC_CONFIG_OVERRIDES` | 运行配置覆写 JSON；例如包含 `mongo.uri` 与 `auth.access_token_secret` 的真实值，不能放到代码仓库 |
+| Secret，可选 | `PICPAC_CONFIG_OVERRIDES` | 未配置时按空覆盖对象处理；后续可填写运行配置覆写 JSON，不将真实值提交到代码仓库 |
 | Secret | `SSH_HOST` | k3s 服务器公网地址 |
 | Secret | `SSH_USER` | 已绑定密钥的账号，例如 ubuntu；必须可免交互提权 |
 | Secret | `SSH_PRIVATE_KEY` | PEM 私钥完整内容，保留首尾标记和换行 |
@@ -42,7 +42,7 @@
 
 1. 保证 GitHub runner 能连接 SSH 端口。GitHub 托管 runner 出口 IP 不固定，仅允许个人电脑来源 IP 时，它无法直接 SSH 部署。
 2. 在目标登录账号下验证 `sudo -n -i /usr/local/bin/k3s kubectl get nodes`。该命令必须无需密码、无需交互；流水线不修改 sudo 权限。
-3. 配置 `PICPAC_CONFIG_OVERRIDES` 后，服务器无需提前创建 JSON；每次部署会自动创建或覆盖 `K3S_CONFIG_PATH`，权限为 600。真实凭证不能提交到 Git，也不能直接用仓库占位值部署。
+3. 服务器无需提前创建 JSON；每次部署自动创建或覆盖 `K3S_CONFIG_PATH`，权限为 600。未设置额外配置 Secret 时，JWT 在服务器本地生成并复用；Mongo 凭证在服务器上从现有 Mongo Pod 环境或其引用的 Secret 中读取，不传回 GitHub、不修改 Mongo。若现有 Mongo 凭证无法发现，部署明确失败。
 4. Mongo URI 应使用 Service 地址或可达内网地址。若输入仍是 localhost/127.0.0.1，脚本会查找唯一一个 NodePort 32017 对应的 Mongo Service，并转换成集群 DNS 地址，保留账号、数据库及副本集参数；找不到时明确失败。不会修改已有 Mongo Service 或数据。
 5. 为外部访问在**实例防火墙**放行 TCP 32090。修改模板不会自动修改既有实例规则。SSH 的 22 与 Mongo 的 32017 各有独立用途。
 
@@ -55,7 +55,7 @@
   → 容器 /app/config/config.json
 ```
 
-运行配置会转换为无 BOM 的 UTF-8 JSON，仓库中的敏感占位值必须由 Secret 覆盖。镜像已设置 `PICPAC_CONFIG` 指向挂载文件，`category.json` 位于 `/app/category.json`。Secret 文件权限为 0444，容器用户 10001 可读。旧 Pod 的 subPath 配置不会直接热更新；部署使用配置校验值触发新 Pod。修改已有应用端口时，要同步调整已有 Deployment 和 Service。
+运行配置会转换为无 BOM 的 UTF-8 JSON。JWT 本地生成并保存在配置目录的 `.picpac-jwt-secret`，不会每次重建；已经有效的服务器 JWT 和 Mongo URI 优先复用。OSS、短信和 AI 的占位 Key 可在后续通过配置覆写补齐；未配置真实 Key 时，这些外部服务功能不可用。镜像已设置 `PICPAC_CONFIG` 指向挂载文件，`category.json` 位于 `/app/category.json`。Secret 文件权限为 0444，容器用户 10001 可读。旧 Pod 的 subPath 配置不会直接热更新；部署使用配置校验值触发新 Pod。修改已有应用端口时，要同步调整已有 Deployment 和 Service。
 
 ## 手动重试部署，不重新构建镜像
 

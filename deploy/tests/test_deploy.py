@@ -43,8 +43,10 @@ args="$*"
 case "$args" in
   *'get services -A -o json'*)
     if [[ "${FAKE_MONGO_SERVICE:-0}" == 1 ]]; then
-      echo '{"items":[{"metadata":{"name":"mongodb","namespace":"data"},"spec":{"ports":[{"port":27017,"nodePort":32017}]}}]}'
+      echo '{"items":[{"metadata":{"name":"mongodb","namespace":"data"},"spec":{"selector":{"app":"mongodb"},"ports":[{"port":27017,"nodePort":32017}]}}]}'
     else echo '{"items":[]}'; fi ;;
+  *'get pods -l '*)
+    echo '{"items":[{"spec":{"containers":[{"env":[{"name":"MONGO_INITDB_ROOT_USERNAME","value":"example-user"},{"name":"MONGO_INITDB_ROOT_PASSWORD","value":"test-only-password"}]}]}}]}' ;;
   *'get deployment picpac --ignore-not-found'*)
     if [[ "${FAKE_EXISTING:-0}" == 1 ]]; then echo deployment.apps/picpac; fi ;;
   *'get service picpac --ignore-not-found'*)
@@ -76,6 +78,7 @@ esac
             self.bash = r"C:\Program Files\Git\bin\bash.exe"
         if not self.bash:
             self.skipTest("bash is required")
+        self.env["BASH_FOR_TESTS"] = self.bash
 
     def run_deploy(self, image=IMAGE, node_port="32090", incoming=None, destination=None):
         args = [
@@ -165,7 +168,9 @@ esac
             shell_path = "/" + shell_path[0].lower() + shell_path[2:]
         result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(destination.read_text()), json.loads(self.config.read_text()))
+        config = json.loads(destination.read_text())
+        self.assertEqual(config["server"], {"port": "9090"})
+        self.assertGreater(len(config["auth"]["access_token_secret"]), 40)
 
     def test_loopback_mongo_resolves_only_the_selected_service(self):
         self.env["FAKE_MONGO_SERVICE"] = "1"
@@ -180,19 +185,26 @@ esac
         result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         config = json.loads(destination.read_text())
-        self.assertEqual(config["mongo"]["uri"], "mongodb://mongodb.data.svc.cluster.local:27017/picpac?replicaSet=rs0")
+        self.assertEqual(config["mongo"]["uri"], "mongodb://example-user:test-only-password@mongodb.data.svc.cluster.local:27017/picpac?replicaSet=rs0")
 
-    def test_repository_credential_placeholders_are_not_deployed(self):
+    def test_jwt_is_generated_on_server_and_preserved(self):
         placeholder = "\u5077apikey\u7684\u66ff\u6211\u6321\u707e"
         self.config.write_text(json.dumps({
             "server": {"port": "9090"},
             "mongo": {"uri": "mongodb://mongo.example:27017/picpac"},
             "auth": {"access_token_secret": placeholder},
         }))
-        result = self.run_deploy()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("repository placeholders", result.stderr)
-        self.assertFalse(self.calls.exists())
+        destination = self.work / "server-config.json"
+        shell_path = destination.as_posix()
+        if os.name == "nt":
+            shell_path = "/" + shell_path[0].lower() + shell_path[2:]
+        result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        key = json.loads(destination.read_text())["auth"]["access_token_secret"]
+        self.assertNotEqual(key, placeholder)
+        result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(destination.read_text())["auth"]["access_token_secret"], key)
 
     def test_failed_rollout_is_reported_as_failure(self):
         self.env["FAKE_ROLLOUT_EXIT"] = "1"

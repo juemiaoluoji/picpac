@@ -31,76 +31,7 @@ kube() { "$k3s_bin" kubectl "$@"; }
 work_dir="$(mktemp -d /tmp/picpac-k3s.XXXXXX)"
 trap 'rm -rf -- "$work_dir"' EXIT
 runtime_config="$work_dir/config.json"
-port="$("$python_bin" - "$config_source" "$runtime_config" <<'PY'
-import json, re, sys
-from urllib.parse import unquote
-try:
-    with open(sys.argv[1], encoding='utf-8-sig') as stream:
-        config = json.load(stream)
-except json.JSONDecodeError as error:
-    sys.exit(f'config.json is not valid JSON: {error.msg} (line {error.lineno}, column {error.colno}).')
-except (OSError, UnicodeDecodeError):
-    sys.exit('config.json must be a readable UTF-8 JSON file.')
-if not isinstance(config, dict):
-    sys.exit('config.json must contain a JSON object.')
-server = config.get('server')
-if not isinstance(server, dict):
-    sys.exit('config.json is missing the server object.')
-port = server.get('port')
-if not isinstance(port, str) or not re.fullmatch(r'[0-9]{1,5}', port) or not 1 <= int(port) <= 65535:
-    sys.exit('config.json server.port must be a numeric string, for example "9090".')
-mongo = config.get('mongo')
-if not isinstance(mongo, dict):
-    sys.exit('config.json is missing the mongo object.')
-uri = mongo.get('uri')
-if not isinstance(uri, str) or not uri.startswith(('mongodb://', 'mongodb+srv://')):
-    sys.exit('config.json mongo.uri must start with mongodb:// or mongodb+srv://.')
-placeholder = '\u5077apikey\u7684\u66ff\u6211\u6321\u707e'
-auth = config.get('auth', {})
-if placeholder in unquote(uri) or (isinstance(auth, dict) and auth.get('access_token_secret') == placeholder):
-    sys.exit('Runtime Mongo/JWT credentials still contain repository placeholders. Configure PICPAC_CONFIG_OVERRIDES before deployment.')
-hosts = uri.split('://', 1)[1].split('/', 1)[0].rsplit('@', 1)[-1]
-if not hosts:
-    sys.exit('config.json mongo.uri must include a host.')
-with open(sys.argv[2], 'w', encoding='utf-8') as stream:
-    json.dump(config, stream, ensure_ascii=False)
-print(int(port))
-PY
-)"
-needs_mongo_service="$("$python_bin" - "$runtime_config" <<'PY'
-import json, re, sys
-with open(sys.argv[1], encoding='utf-8') as stream:
-    uri = json.load(stream)['mongo']['uri']
-hosts = uri.split('://', 1)[1].split('/', 1)[0].rsplit('@', 1)[-1]
-print('yes' if re.search(r'(^|,)(localhost|127\.[0-9.]+|\[::1\])(?=[:,?]|$)', hosts, re.I) else 'no')
-PY
-)"
-if [[ "$needs_mongo_service" == yes ]]; then
-  [[ "$mongo_node_port" =~ ^[0-9]{5}$ ]] || { echo 'Invalid Mongo NodePort.' >&2; exit 1; }
-  kube get services -A -o json > "$work_dir/services.json"
-  "$python_bin" - "$runtime_config" "$work_dir/services.json" "$mongo_node_port" <<'PY'
-import json, sys
-from urllib.parse import urlsplit, urlunsplit
-with open(sys.argv[1], encoding='utf-8') as stream:
-    config = json.load(stream)
-with open(sys.argv[2], encoding='utf-8') as stream:
-    services = json.load(stream)
-matches = [(service, port) for service in services.get('items', [])
-           for port in service.get('spec', {}).get('ports', [])
-           if port.get('nodePort') == int(sys.argv[3])]
-if len(matches) != 1:
-    sys.exit('Mongo URI uses loopback and no unique Mongo Service matches MONGO_NODE_PORT. Configure a reachable mongo.uri override.')
-service, port = matches[0]
-host = f"{service['metadata']['name']}.{service['metadata']['namespace']}.svc.cluster.local:{port['port']}"
-parsed = urlsplit(config['mongo']['uri'])
-credentials, separator, _ = parsed.netloc.rpartition('@')
-netloc = (credentials + '@' if separator else '') + host
-config['mongo']['uri'] = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
-with open(sys.argv[1], 'w', encoding='utf-8') as stream:
-    json.dump(config, stream, ensure_ascii=False)
-print('Mongo endpoint uses its in-cluster Service: ' + host)
-PY
-fi
+port="$("$python_bin" "$(dirname "$template_file")/prepare-config.py" "$config_source" "$runtime_config" "$config_file" "$k3s_bin" "$mongo_node_port")"
 if [[ -n "$incoming_config" ]]; then
   [[ "$config_file" == /* ]] || { echo 'Config destination must be an absolute server path.' >&2; exit 1; }
   mkdir -p -- "$(dirname "$config_file")"
