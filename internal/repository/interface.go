@@ -17,6 +17,11 @@ type CategoryRepository interface {
 	UpsertByKey(ctx context.Context, category *domain.Category) error
 }
 
+// LaunchScreenRepository defines persistence behavior for launch screen configuration.
+type LaunchScreenRepository interface {
+	GetActive(ctx context.Context) (*domain.LaunchScreen, error)
+}
+
 // ItemRepository defines persistence behavior for items.
 type ItemRepository interface {
 	Create(ctx context.Context, item *domain.Item) error
@@ -67,6 +72,7 @@ type ChecklistRepository interface {
 
 // UserRepository defines persistence behavior for users.
 type UserRepository interface {
+	PatchProfile(ctx context.Context, userID bson.ObjectID, patch UserProfilePatch, updatedAt time.Time) (*domain.User, error)
 	Create(ctx context.Context, user *domain.User) error
 	GetByID(ctx context.Context, userID bson.ObjectID) (*domain.User, error)
 	Update(ctx context.Context, user *domain.User) error
@@ -76,16 +82,8 @@ type UserRepository interface {
 type AuthIdentityRepository interface {
 	Create(ctx context.Context, identity *domain.AuthIdentity) error
 	GetByProviderAndIdentifier(ctx context.Context, provider domain.AuthProvider, identifier string) (*domain.AuthIdentity, error)
+	GetByUserIDAndProvider(ctx context.Context, userID bson.ObjectID, provider domain.AuthProvider) (*domain.AuthIdentity, error)
 	DisableByUserID(ctx context.Context, userID bson.ObjectID, disabledAt time.Time) error
-}
-
-// PhoneVerificationCodeRepository defines persistence behavior for phone verification codes.
-type PhoneVerificationCodeRepository interface {
-	Create(ctx context.Context, code *domain.PhoneVerificationCode) error
-	GetLatestActive(ctx context.Context, phone string, purpose domain.PhoneVerificationPurpose, now time.Time) (*domain.PhoneVerificationCode, error)
-	MarkConsumed(ctx context.Context, codeID bson.ObjectID, consumedAt time.Time) error
-	IncrementAttempt(ctx context.Context, codeID bson.ObjectID) error
-	CountRecent(ctx context.Context, phone string, since time.Time) (int64, error)
 }
 
 // RefreshTokenRepository defines persistence behavior for refresh tokens.
@@ -98,6 +96,7 @@ type RefreshTokenRepository interface {
 
 // UserPasswordCredentialRepository defines persistence behavior for password credentials.
 type UserPasswordCredentialRepository interface {
+	UpdatePasswordAndRevokeTokens(ctx context.Context, userID bson.ObjectID, expectedHash, passwordHash, passwordAlgo string, updatedAt time.Time) error
 	Create(ctx context.Context, credential *domain.UserPasswordCredential) error
 	GetByUserID(ctx context.Context, userID bson.ObjectID) (*domain.UserPasswordCredential, error)
 	RecordFailure(ctx context.Context, userID bson.ObjectID, failedAttemptCount int, lockedUntil *time.Time, updatedAt time.Time) error

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -17,7 +18,11 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-func newRouter(cfg *config.Configuration, bucket *oss.Bucket, db *mongo.Database) *gin.Engine {
+func newRouter(cfg *config.Configuration, bucket *oss.Bucket, db *mongo.Database) (*gin.Engine, error) {
+	verification, err := newPhoneVerificationService(cfg)
+	if err != nil {
+		return nil, err
+	}
 	router := gin.Default()
 	router.Use(corsMiddleware(cfg.CORS.AllowedOrigins))
 
@@ -25,38 +30,51 @@ func newRouter(cfg *config.Configuration, bucket *oss.Bucket, db *mongo.Database
 	packRepo := mongodb.NewPackRepository(db)
 	checklistRepo := mongodb.NewChecklistRepository(db)
 	categoryRepo := mongodb.NewCategoryRepository(db)
+	launchScreenRepo := mongodb.NewLaunchScreenRepository(db)
 	userRepo := mongodb.NewUserRepository(db)
 	authIdentityRepo := mongodb.NewAuthIdentityRepository(db)
-	phoneCodeRepo := mongodb.NewPhoneVerificationCodeRepository(db)
 	refreshTokenRepo := mongodb.NewRefreshTokenRepository(db)
 	passwordCredentialRepo := mongodb.NewUserPasswordCredentialRepository(db)
 	uploadService := service.NewOSSUploadService(bucket, cfg.OSS.SignedURLTTLSeconds)
 	tokenService := service.NewTokenService(cfg.Auth.AccessTokenSecret, time.Duration(cfg.Auth.AccessTokenTTLSeconds)*time.Second)
 	categoryService := service.NewCategoryService(categoryRepo)
+	launchScreenService := service.NewLaunchScreenService(launchScreenRepo, uploadService)
 	itemService := service.NewItemService(itemRepo, uploadService, categoryService)
 	packService := service.NewPackService(packRepo, itemRepo)
 	checklistService := service.NewChecklistService(checklistRepo, itemRepo)
-	authService := service.NewAuthService(userRepo, authIdentityRepo, phoneCodeRepo, refreshTokenRepo, passwordCredentialRepo, uploadService, service.NewFakeSMSService(), tokenService, cfg.Auth)
+	authService := service.NewAuthService(userRepo, authIdentityRepo, refreshTokenRepo, passwordCredentialRepo, uploadService, verification, tokenService, cfg.Auth, cfg.Env)
 	chatClient := llm.NewDeepSeekChatClient(cfg.Deepseek)
 	recommendationAgent := agent.NewRecommendationPlannerAgent(chatClient)
 	itemDraftExtractionAgent := agent.NewChatItemDraftExtractionAgent(chatClient)
 	aiSuggestionService := service.NewAISuggestionService(itemService, categoryService, recommendationAgent, itemDraftExtractionAgent)
 
-	registerAPIRoutes(router, itemService, packService, checklistService, categoryService, aiSuggestionService, authService, tokenService, uploadService)
+	registerAPIRoutes(router, itemService, packService, checklistService, categoryService, launchScreenService, aiSuggestionService, authService, tokenService, uploadService, cfg.Auth.ProfileUpload)
 
-	return router
+	return router, nil
 }
 
-func registerAPIRoutes(router *gin.Engine, itemService service.ItemService, packService service.PackService, checklistService service.ChecklistService, categoryService service.CategoryService, aiSuggestionService service.AISuggestionService, authService service.AuthService, tokenService service.TokenService, objectURLSigner service.ObjectURLSigner) {
+func newPhoneVerificationService(cfg *config.Configuration) (service.PhoneVerificationService, error) {
+	if cfg.Env == "dev" {
+		return nil, nil
+	}
+	if cfg.Env != "prod" {
+		return nil, fmt.Errorf("invalid config: env must be dev or prod")
+	}
+	return service.NewAliyunPhoneVerificationService(cfg.Auth.PhoneCode)
+}
+
+func registerAPIRoutes(router *gin.Engine, itemService service.ItemService, packService service.PackService, checklistService service.ChecklistService, categoryService service.CategoryService, launchScreenService service.LaunchScreenService, aiSuggestionService service.AISuggestionService, authService service.AuthService, tokenService service.TokenService, objectURLSigner service.ObjectURLSigner, profileLimits ...config.ProfileUploadConfig) {
 	itemHandler := handler.NewItemHandler(itemService, categoryService, objectURLSigner)
 	packHandler := handler.NewPackHandler(packService)
 	checklistHandler := handler.NewChecklistHandler(checklistService)
 	categoryHandler := handler.NewCategoryHandler(categoryService)
 	aiHandler := handler.NewAIHandler(aiSuggestionService)
-	authHandler := handler.NewAuthHandler(authService, objectURLSigner)
+	launchScreenHandler := handler.NewLaunchScreenHandler(launchScreenService)
+	authHandler := handler.NewAuthHandler(authService, objectURLSigner, profileLimits...)
 	authMiddleware := handler.NewAuthMiddleware(tokenService, authService)
 
 	router.GET("/api/v1/categories", categoryHandler.ListCategories)
+	router.GET("/api/v1/app/launch-screen", launchScreenHandler.Get)
 
 	authRoutes := router.Group("/api/v1/auth")
 	authRoutes.POST("/phone/code", authHandler.SendPhoneCode)
@@ -66,9 +84,12 @@ func registerAPIRoutes(router *gin.Engine, itemService service.ItemService, pack
 	authRoutes.POST("/refresh", authHandler.Refresh)
 	authRoutes.POST("/logout", authHandler.Logout)
 	authRoutes.POST("/password/setup", authMiddleware.RequireAuth(), authHandler.SetupPassword)
+	authRoutes.POST("/password/reset", authMiddleware.RequireAuth(), authHandler.ResetPassword)
 	authRoutes.PUT("/password", authMiddleware.RequireAuth(), authHandler.ChangePassword)
+	authRoutes.GET("/security", authMiddleware.RequireAuth(), authHandler.GetSecurity)
 	authRoutes.DELETE("/me", authMiddleware.RequireAuth(), authHandler.DeleteMe)
 	router.GET("/api/v1/me", authMiddleware.RequireAuth(), authHandler.Me)
+	router.PATCH("/api/v1/me/profile", authMiddleware.RequireAuth(), authHandler.PatchMyProfile)
 	router.PUT("/api/v1/me/profile", authMiddleware.RequireAuth(), authHandler.UpdateMyProfile)
 
 	aiRoutes := router.Group("/api/v1/ai")

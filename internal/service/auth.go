@@ -3,13 +3,9 @@ package service
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"strings"
 	"time"
 	"unicode"
@@ -36,6 +32,33 @@ const (
 	passwordAlgorithmBcrypt    = "bcrypt"
 )
 
+var (
+	// ErrPhoneCodeRateLimited indicates that another code cannot be sent yet.
+	ErrPhoneCodeRateLimited = errors.New("phone code send too frequently")
+	// ErrPhoneVerificationUnavailable indicates that the external verification provider cannot complete the request.
+	ErrPhoneVerificationUnavailable = errors.New("phone verification service is unavailable")
+)
+
+type phoneVerificationError struct {
+	public error
+	cause  error
+}
+
+// Error returns the stable client-facing message.
+func (e *phoneVerificationError) Error() string {
+	return e.public.Error()
+}
+
+// Unwrap preserves the provider failure for server-side diagnostics.
+func (e *phoneVerificationError) Unwrap() error {
+	return e.cause
+}
+
+// Is classifies the error by its stable public category.
+func (e *phoneVerificationError) Is(target error) bool {
+	return target == e.public
+}
+
 // RefreshResult contains a refreshed access token.
 type RefreshResult struct {
 	AccessToken string
@@ -43,6 +66,8 @@ type RefreshResult struct {
 
 // AuthService defines authentication behavior.
 type AuthService interface {
+	PatchMyProfile(ctx context.Context, userID string, input ProfilePatchInput) (*domain.User, error)
+	ResetPassword(ctx context.Context, input ResetPasswordInput) error
 	SendPhoneCode(ctx context.Context, input request.SendPhoneCodeInput) error
 	LoginWithPhone(ctx context.Context, input request.PhoneLoginInput) (*AuthResult, error)
 	LoginWithPhonePassword(ctx context.Context, input request.PhonePasswordLoginInput) (*AuthResult, error)
@@ -50,21 +75,23 @@ type AuthService interface {
 	Logout(ctx context.Context, input request.LogoutInput) error
 	SetupPassword(ctx context.Context, input request.SetupPasswordInput) error
 	ChangePassword(ctx context.Context, input request.ChangePasswordInput) error
+	GetSecurity(ctx context.Context, userID string) (*domain.AuthSecurity, error)
 	Me(ctx context.Context, userID string) (*domain.User, error)
 	UpdateMyProfile(ctx context.Context, userID string, input request.UpdateMyProfileInput) (*domain.User, error)
 	DeleteMe(ctx context.Context, userID string) error
 }
 
 type authService struct {
+	profileUpload   config.ProfileUploadConfig
 	users           repository.UserRepository
 	identities      repository.AuthIdentityRepository
-	phoneCodes      repository.PhoneVerificationCodeRepository
 	refreshTokens   repository.RefreshTokenRepository
 	passwords       repository.UserPasswordCredentialRepository
 	uploader        UploadService
-	sms             SMSService
+	verification    PhoneVerificationService
+	env             string
+	devFixedCode    string
 	tokens          TokenService
-	phoneCodeConfig config.PhoneCodeConfig
 	passwordConfig  config.PasswordConfig
 	refreshTokenTTL time.Duration
 }
@@ -73,24 +100,29 @@ type authService struct {
 func NewAuthService(
 	users repository.UserRepository,
 	identities repository.AuthIdentityRepository,
-	phoneCodes repository.PhoneVerificationCodeRepository,
 	refreshTokens repository.RefreshTokenRepository,
 	passwords repository.UserPasswordCredentialRepository,
 	uploader UploadService,
-	sms SMSService,
+	verification PhoneVerificationService,
 	tokens TokenService,
 	authConfig config.AuthConfig,
+	env string,
 ) AuthService {
+	devFixedCode := strings.TrimSpace(authConfig.PhoneCode.DevFixedCode)
+	if devFixedCode == "" {
+		devFixedCode = "123456"
+	}
 	return &authService{
+		profileUpload:   authConfig.ProfileUpload.WithDefaults(),
 		users:           users,
 		identities:      identities,
-		phoneCodes:      phoneCodes,
 		refreshTokens:   refreshTokens,
 		passwords:       passwords,
 		uploader:        uploader,
-		sms:             sms,
+		verification:    verification,
+		env:             env,
+		devFixedCode:    devFixedCode,
 		tokens:          tokens,
-		phoneCodeConfig: authConfig.PhoneCode,
 		passwordConfig:  authConfig.Password,
 		refreshTokenTTL: time.Duration(authConfig.RefreshTokenTTLSeconds) * time.Second,
 	}
@@ -102,42 +134,18 @@ func (s *authService) SendPhoneCode(ctx context.Context, input request.SendPhone
 	if err != nil {
 		return err
 	}
-
-	now := time.Now().UTC()
-	recentCount, err := s.phoneCodes.CountRecent(ctx, phone, now.Add(-24*time.Hour))
-	if err != nil {
-		return fmt.Errorf("count phone code failed: %w", err)
+	if s.env == "dev" {
+		return nil
 	}
-	if recentCount >= int64(s.phoneCodeConfig.DailySendLimit) {
-		return fmt.Errorf("phone code send too frequently")
+	if s.env != "prod" || s.verification == nil {
+		return &phoneVerificationError{public: ErrPhoneVerificationUnavailable, cause: fmt.Errorf("phone verification service is not configured")}
 	}
 
-	latest, err := s.phoneCodes.GetLatestActive(ctx, phone, domain.PhoneVerificationPurposeLogin, now)
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		return fmt.Errorf("get phone code failed: %w", err)
-	}
-	if latest != nil && latest.CreatedAt.After(now.Add(-time.Duration(s.phoneCodeConfig.ResendIntervalSeconds)*time.Second)) {
-		return fmt.Errorf("phone code send too frequently")
-	}
-
-	code, err := s.newPhoneCode()
-	if err != nil {
-		return fmt.Errorf("generate phone code failed: %w", err)
-	}
-
-	verificationCode := &domain.PhoneVerificationCode{
-		ID:        bson.NewObjectID(),
-		Phone:     phone,
-		CodeHash:  hashPhoneCode(phone, code),
-		Purpose:   domain.PhoneVerificationPurposeLogin,
-		ExpiresAt: now.Add(time.Duration(s.phoneCodeConfig.TTLSeconds) * time.Second),
-		CreatedAt: now,
-	}
-	if err := s.phoneCodes.Create(ctx, verificationCode); err != nil {
-		return fmt.Errorf("create phone code failed: %w", err)
-	}
-	if err := s.sms.SendLoginCode(ctx, phone, code); err != nil {
-		return fmt.Errorf("send phone code failed: %w", err)
+	if err := s.verification.SendCode(ctx, phone); err != nil {
+		if errors.Is(err, errPhoneCodeRateLimited) {
+			return &phoneVerificationError{public: ErrPhoneCodeRateLimited, cause: err}
+		}
+		return &phoneVerificationError{public: ErrPhoneVerificationUnavailable, cause: err}
 	}
 
 	return nil
@@ -153,34 +161,38 @@ func (s *authService) LoginWithPhone(ctx context.Context, input request.PhoneLog
 	if code == "" {
 		return nil, fmt.Errorf("phone code is required")
 	}
-
-	now := time.Now().UTC()
-	verificationCode, err := s.phoneCodes.GetLatestActive(ctx, phone, domain.PhoneVerificationPurposeLogin, now)
-	if err != nil {
-		if errors.Is(err, mongo.ErrNoDocuments) {
+	if len(code) != 6 || !pnvsDigits(code) {
+		return nil, fmt.Errorf("phone code is invalid")
+	}
+	if s.env == "dev" {
+		if code != s.devFixedCode {
 			return nil, fmt.Errorf("phone code is invalid")
 		}
-		return nil, fmt.Errorf("get phone code failed: %w", err)
-	}
-	if verificationCode.AttemptCount >= s.phoneCodeConfig.MaxAttempts {
-		return nil, fmt.Errorf("phone code is invalid")
-	}
-	if err := s.phoneCodes.IncrementAttempt(ctx, verificationCode.ID); err != nil {
-		return nil, fmt.Errorf("increment phone code attempt failed: %w", err)
-	}
-	if verificationCode.CodeHash != hashPhoneCode(phone, code) {
-		return nil, fmt.Errorf("phone code is invalid")
-	}
-	if err := s.phoneCodes.MarkConsumed(ctx, verificationCode.ID, now); err != nil {
-		return nil, fmt.Errorf("consume phone code failed: %w", err)
+	} else {
+		if s.env != "prod" || s.verification == nil {
+			return nil, &phoneVerificationError{public: ErrPhoneVerificationUnavailable, cause: fmt.Errorf("phone verification service is not configured")}
+		}
+		if err := s.verifyPhoneCode(ctx, phone, code); err != nil {
+			return nil, err
+		}
 	}
 
 	user, err := s.getOrCreatePhoneUser(ctx, phone)
 	if err != nil {
 		return nil, err
 	}
-
 	return s.newAuthResult(ctx, user)
+}
+
+func (s *authService) verifyPhoneCode(ctx context.Context, phone, code string) error {
+	valid, err := s.verification.VerifyCode(ctx, phone, code)
+	if err != nil {
+		return &phoneVerificationError{public: ErrPhoneVerificationUnavailable, cause: err}
+	}
+	if !valid {
+		return fmt.Errorf("phone code is invalid")
+	}
+	return nil
 }
 
 // LoginWithPhonePassword logs in with a phone number and password.
@@ -409,6 +421,41 @@ func (s *authService) ChangePassword(ctx context.Context, input request.ChangePa
 	return nil
 }
 
+// GetSecurity returns the current user's account security status.
+func (s *authService) GetSecurity(ctx context.Context, userID string) (*domain.AuthSecurity, error) {
+	objectID, err := parseObjectID(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid input")
+	}
+
+	if _, err := s.getActiveUserByID(ctx, objectID); err != nil {
+		return nil, err
+	}
+
+	security := &domain.AuthSecurity{}
+	identity, err := s.identities.GetByUserIDAndProvider(ctx, objectID, domain.AuthProviderPhone)
+	if err != nil {
+		if !errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, fmt.Errorf("get phone identity failed: %w", err)
+		}
+	} else {
+		security.Phone = maskPhone(identity.Identifier)
+	}
+
+	if s.passwords == nil {
+		return nil, fmt.Errorf("password credential repository is not configured")
+	}
+	if _, err := s.passwords.GetByUserID(ctx, objectID); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return security, nil
+		}
+		return nil, fmt.Errorf("get password credential failed: %w", err)
+	}
+	security.PasswordSetup = true
+
+	return security, nil
+}
+
 // Me returns the current user.
 func (s *authService) Me(ctx context.Context, userID string) (*domain.User, error) {
 	objectID, err := parseObjectID(userID)
@@ -421,64 +468,10 @@ func (s *authService) Me(ctx context.Context, userID string) (*domain.User, erro
 
 // UpdateMyProfile updates the current user profile.
 func (s *authService) UpdateMyProfile(ctx context.Context, userID string, input request.UpdateMyProfileInput) (*domain.User, error) {
-	objectID, err := parseObjectID(userID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid input")
-	}
-
-	user, err := s.getActiveUserByID(ctx, objectID)
-	if err != nil {
-		return nil, err
-	}
-
-	username := strings.TrimSpace(input.Username)
-	if username == "" {
-		return nil, fmt.Errorf("username is required")
-	}
-	if len([]rune(username)) > 32 {
-		return nil, fmt.Errorf("username is too long")
-	}
-
-	gender, err := parseRequiredUserGender(input.Gender)
-	if err != nil {
-		return nil, err
-	}
-
-	birthday, err := parseOptionalBirthday(input.Birthday)
-	if err != nil {
-		return nil, err
-	}
-
-	avatarObjectKey := strings.TrimSpace(user.Profile.AvatarObjectKey)
-	avatarDisplayObjectKey := strings.TrimSpace(user.Profile.AvatarDisplayObjectKey)
-	if input.File != nil {
-		avatarObjectKey, avatarDisplayObjectKey, err = s.uploadUserAvatar(ctx, user.ID, input.FileName, input.File)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if avatarObjectKey == "" {
-		return nil, fmt.Errorf("avatar is required")
-	}
-	if avatarDisplayObjectKey == "" {
-		avatarDisplayObjectKey = avatarObjectKey
-	}
-
-	user.Profile.Username = username
-	user.Profile.Gender = gender
-	user.Profile.Birthday = birthday
-	user.Profile.AvatarObjectKey = avatarObjectKey
-	user.Profile.AvatarDisplayObjectKey = avatarDisplayObjectKey
-	user.UpdatedAt = time.Now().UTC()
-
-	if err := s.users.Update(ctx, user); err != nil {
-		if errors.Is(err, mongo.ErrNoDocuments) {
-			return nil, fmt.Errorf("user not found")
-		}
-		return nil, fmt.Errorf("update user profile failed: %w", err)
-	}
-
-	return user, nil
+	return s.PatchMyProfile(ctx, userID, ProfilePatchInput{
+		Username: &input.Username, Gender: &input.Gender, Birthday: &input.Birthday,
+		File: input.File, FileName: input.FileName,
+	})
 }
 
 // DeleteMe deletes the current user account logically.
@@ -617,57 +610,35 @@ func (s *authService) newAuthResult(ctx context.Context, user *domain.User) (*Au
 	}, nil
 }
 
-func (s *authService) newPhoneCode() (string, error) {
-	if s.phoneCodeConfig.UseDevFixedCode {
-		return strings.TrimSpace(s.phoneCodeConfig.DevFixedCode), nil
-	}
-
-	value, err := rand.Int(rand.Reader, big.NewInt(1000000))
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%06d", value.Int64()), nil
-}
-
 func normalizePhone(value string) (string, error) {
 	phone := strings.TrimSpace(value)
 	if phone == "" {
 		return "", fmt.Errorf("phone is required")
 	}
-	if strings.HasPrefix(phone, "+") {
-		if len(phone) < 9 || !allDigits(phone[1:]) {
-			return "", fmt.Errorf("phone is invalid")
-		}
-		return phone, nil
-	}
-	if !allDigits(phone) {
+	phone, err := normalizePNVSPhone(phone)
+	if err != nil {
 		return "", fmt.Errorf("phone is invalid")
 	}
-	if len(phone) == 11 && strings.HasPrefix(phone, "1") {
-		return "+86" + phone, nil
-	}
-	if len(phone) < 8 {
-		return "", fmt.Errorf("phone is invalid")
-	}
-	return "+" + phone, nil
+	return "+86" + phone, nil
 }
 
-func allDigits(value string) bool {
-	for _, r := range value {
-		if !unicode.IsDigit(r) {
-			return false
-		}
+func maskPhone(phone string) string {
+	phone = strings.TrimSpace(phone)
+	if strings.HasPrefix(phone, "+86") && len(phone) == 14 {
+		return phone[3:6] + "****" + phone[10:]
 	}
-	return true
-}
-
-func hashPhoneCode(phone string, code string) string {
-	sum := sha256.Sum256([]byte(phone + ":" + strings.TrimSpace(code)))
-	return hex.EncodeToString(sum[:])
+	if len(phone) <= 7 {
+		return phone
+	}
+	return phone[:3] + "****" + phone[len(phone)-4:]
 }
 
 func newDefaultUsername(phone string) string {
-	return "user" + digitsOnly(phone)
+	digits := digitsOnly(phone)
+	if len(digits) > 4 {
+		digits = digits[len(digits)-4:]
+	}
+	return "picpacker_" + digits
 }
 
 func (s *authService) hashPassword(password string) (string, error) {

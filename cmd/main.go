@@ -45,7 +45,10 @@ func main() {
 		port = "8080"
 	}
 
-	router := newRouter(appCfg, bucket, mongoConn.Database)
+	router, err := newRouter(appCfg, bucket, mongoConn.Database)
+	if err != nil {
+		panic(err)
+	}
 
 	if err := router.Run(":" + port); err != nil {
 		panic(err)

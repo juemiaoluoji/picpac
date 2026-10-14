@@ -86,33 +86,7 @@ func (r *fakeAuthIdentityRepository) GetByProviderAndIdentifier(_ context.Contex
 	return r.got, nil
 }
 
-func (r *fakeAuthIdentityRepository) DisableByUserID(_ context.Context, userID bson.ObjectID, _ time.Time) error {
-	if r.err != nil {
-		return r.err
-	}
-	r.disabledUserID = userID
-	return nil
-}
-
-type fakePhoneCodeRepository struct {
-	created     *domain.PhoneVerificationCode
-	got         *domain.PhoneVerificationCode
-	consumed    bson.ObjectID
-	attempted   bson.ObjectID
-	recentCount int64
-	err         error
-}
-
-func (r *fakePhoneCodeRepository) Create(_ context.Context, code *domain.PhoneVerificationCode) error {
-	if r.err != nil {
-		return r.err
-	}
-	r.created = code
-	r.got = code
-	return nil
-}
-
-func (r *fakePhoneCodeRepository) GetLatestActive(_ context.Context, _ string, _ domain.PhoneVerificationPurpose, _ time.Time) (*domain.PhoneVerificationCode, error) {
+func (r *fakeAuthIdentityRepository) GetByUserIDAndProvider(_ context.Context, _ bson.ObjectID, _ domain.AuthProvider) (*domain.AuthIdentity, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -122,27 +96,12 @@ func (r *fakePhoneCodeRepository) GetLatestActive(_ context.Context, _ string, _
 	return r.got, nil
 }
 
-func (r *fakePhoneCodeRepository) MarkConsumed(_ context.Context, codeID bson.ObjectID, _ time.Time) error {
+func (r *fakeAuthIdentityRepository) DisableByUserID(_ context.Context, userID bson.ObjectID, _ time.Time) error {
 	if r.err != nil {
 		return r.err
 	}
-	r.consumed = codeID
+	r.disabledUserID = userID
 	return nil
-}
-
-func (r *fakePhoneCodeRepository) IncrementAttempt(_ context.Context, codeID bson.ObjectID) error {
-	if r.err != nil {
-		return r.err
-	}
-	r.attempted = codeID
-	return nil
-}
-
-func (r *fakePhoneCodeRepository) CountRecent(_ context.Context, _ string, _ time.Time) (int64, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-	return r.recentCount, nil
 }
 
 type fakeRefreshTokenRepository struct {
@@ -268,10 +227,13 @@ func (r *fakeUserPasswordCredentialRepository) UpdatePassword(_ context.Context,
 	return nil
 }
 
-type recordingSMSService struct {
-	phone string
-	code  string
-	err   error
+type recordingPhoneVerificationService struct {
+	phone       string
+	code        string
+	err         error
+	verifyErr   error
+	wantCode    string
+	verifyCalls int
 }
 
 type fakeAuthUploadService struct {
@@ -299,13 +261,22 @@ func testImageReader() *bytes.Reader {
 	return bytes.NewReader(body.Bytes())
 }
 
-func (s *recordingSMSService) SendLoginCode(_ context.Context, phone string, code string) error {
+func (s *recordingPhoneVerificationService) SendCode(_ context.Context, phone string) error {
 	if s.err != nil {
 		return s.err
 	}
 	s.phone = phone
-	s.code = code
 	return nil
+}
+
+func (s *recordingPhoneVerificationService) VerifyCode(_ context.Context, phone, code string) (bool, error) {
+	s.verifyCalls++
+	s.phone, s.code = phone, code
+	want := s.wantCode
+	if want == "" {
+		want = "123456"
+	}
+	return code == want, s.verifyErr
 }
 
 func validAuthConfig() config.AuthConfig {
@@ -313,14 +284,7 @@ func validAuthConfig() config.AuthConfig {
 		AccessTokenSecret:      "test-secret",
 		AccessTokenTTLSeconds:  7200,
 		RefreshTokenTTLSeconds: 2592000,
-		PhoneCode: config.PhoneCodeConfig{
-			TTLSeconds:            300,
-			MaxAttempts:           5,
-			ResendIntervalSeconds: 60,
-			DailySendLimit:        10,
-			UseDevFixedCode:       true,
-			DevFixedCode:          "123456",
-		},
+		PhoneCode:              config.AliyunPNVSConfig{DevFixedCode: "123456"},
 		Password: config.PasswordConfig{
 			BcryptCost:          bcrypt.MinCost,
 			MaxFailedAttempts:   5,
@@ -329,69 +293,42 @@ func validAuthConfig() config.AuthConfig {
 	}
 }
 
-func newTestAuthService(users *fakeUserRepository, identities *fakeAuthIdentityRepository, codes *fakePhoneCodeRepository, refreshTokens *fakeRefreshTokenRepository, sms *recordingSMSService) AuthService {
+func newTestAuthService(users *fakeUserRepository, identities *fakeAuthIdentityRepository, refreshTokens *fakeRefreshTokenRepository, verification *recordingPhoneVerificationService) AuthService {
 	cfg := validAuthConfig()
 	return NewAuthService(
 		users,
 		identities,
-		codes,
 		refreshTokens,
 		&fakeUserPasswordCredentialRepository{},
 		&fakeAuthUploadService{},
-		sms,
+		verification,
 		NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second),
 		cfg,
+		"prod",
 	)
 }
 
-func TestSendPhoneCodeStoresAndSendsCode(t *testing.T) {
+func TestSendPhoneCodeUsesProvider(t *testing.T) {
 	t.Parallel()
 
-	codes := &fakePhoneCodeRepository{}
-	sms := &recordingSMSService{}
-	svc := newTestAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, codes, &fakeRefreshTokenRepository{}, sms)
+	verification := &recordingPhoneVerificationService{}
+	svc := newTestAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, verification)
 
 	if err := svc.SendPhoneCode(context.Background(), request.SendPhoneCodeInput{Phone: "13800138000"}); err != nil {
 		t.Fatalf("SendPhoneCode returned error: %v", err)
 	}
-	if codes.created == nil || codes.created.Phone != "+8613800138000" {
-		t.Fatalf("expected normalized code to be stored, got %+v", codes.created)
-	}
-	if sms.phone != "+8613800138000" || sms.code != "123456" {
-		t.Fatalf("unexpected sms send: phone=%s code=%s", sms.phone, sms.code)
-	}
-}
-
-func TestSendPhoneCodeRejectsTooFrequentRequests(t *testing.T) {
-	t.Parallel()
-
-	codes := &fakePhoneCodeRepository{recentCount: int64(validAuthConfig().PhoneCode.DailySendLimit)}
-	svc := newTestAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, codes, &fakeRefreshTokenRepository{}, &recordingSMSService{})
-
-	err := svc.SendPhoneCode(context.Background(), request.SendPhoneCodeInput{Phone: "13800138000"})
-	if err == nil || !strings.Contains(err.Error(), "phone code send too frequently") {
-		t.Fatalf("expected too frequent error, got %v", err)
+	if verification.phone != "+8613800138000" || verification.code != "" {
+		t.Fatalf("unexpected verification send: phone=%s code=%s", verification.phone, verification.code)
 	}
 }
 
 func TestLoginWithPhoneCreatesUserOnFirstLogin(t *testing.T) {
 	t.Parallel()
 
-	codeID := bson.NewObjectID()
-	codes := &fakePhoneCodeRepository{
-		got: &domain.PhoneVerificationCode{
-			ID:        codeID,
-			Phone:     "+8613800138000",
-			CodeHash:  hashPhoneCode("+8613800138000", "123456"),
-			Purpose:   domain.PhoneVerificationPurposeLogin,
-			ExpiresAt: time.Now().Add(time.Minute),
-			CreatedAt: time.Now().Add(-time.Minute),
-		},
-	}
 	users := &fakeUserRepository{}
 	identities := &fakeAuthIdentityRepository{}
 	refreshTokens := &fakeRefreshTokenRepository{}
-	svc := newTestAuthService(users, identities, codes, refreshTokens, &recordingSMSService{})
+	svc := newTestAuthService(users, identities, refreshTokens, &recordingPhoneVerificationService{})
 
 	result, err := svc.LoginWithPhone(context.Background(), request.PhoneLoginInput{
 		Phone: "13800138000",
@@ -403,8 +340,8 @@ func TestLoginWithPhoneCreatesUserOnFirstLogin(t *testing.T) {
 	if users.created == nil {
 		t.Fatalf("expected user to be created")
 	}
-	if users.created.Profile.Username != "user8613800138000" {
-		t.Fatalf("expected default username user8613800138000, got %+v", users.created.Profile)
+	if users.created.Profile.Username != "picpacker_8000" {
+		t.Fatalf("expected default username picpacker_8000, got %+v", users.created.Profile)
 	}
 	if users.created.Profile.AvatarObjectKey != defaultUserAvatarObjectKey {
 		t.Fatalf("expected default avatar object key %s, got %s", defaultUserAvatarObjectKey, users.created.Profile.AvatarObjectKey)
@@ -414,9 +351,6 @@ func TestLoginWithPhoneCreatesUserOnFirstLogin(t *testing.T) {
 	}
 	if identities.created == nil || identities.created.UserID != users.created.ID {
 		t.Fatalf("expected identity to be created for user, got %+v", identities.created)
-	}
-	if codes.attempted != codeID || codes.consumed != codeID {
-		t.Fatalf("expected code attempt and consume, got attempted=%s consumed=%s", codes.attempted.Hex(), codes.consumed.Hex())
 	}
 	if result.AccessToken == "" || result.RefreshToken == "" || refreshTokens.created == nil {
 		t.Fatalf("expected tokens to be created, got result=%+v stored=%+v", result, refreshTokens.created)
@@ -428,16 +362,9 @@ func TestLoginWithPhoneReusesExistingUser(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	user := &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}
-	codes := &fakePhoneCodeRepository{
-		got: &domain.PhoneVerificationCode{
-			ID:       bson.NewObjectID(),
-			Phone:    "+8613800138000",
-			CodeHash: hashPhoneCode("+8613800138000", "123456"),
-		},
-	}
 	users := &fakeUserRepository{got: user}
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000"}}
-	svc := newTestAuthService(users, identities, codes, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, identities, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	result, err := svc.LoginWithPhone(context.Background(), request.PhoneLoginInput{Phone: "13800138000", Code: "123456"})
 	if err != nil {
@@ -464,7 +391,7 @@ func TestLoginWithPhonePasswordReturnsTokens(t *testing.T) {
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: string(passwordHash), PasswordAlgo: passwordAlgorithmBcrypt, FailedAttemptCount: 2}}
 	refreshTokens := &fakeRefreshTokenRepository{}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	result, err := svc.LoginWithPhonePassword(context.Background(), request.PhonePasswordLoginInput{
 		Phone:    "13800138000",
@@ -493,7 +420,7 @@ func TestLoginWithPhonePasswordRecordsFailure(t *testing.T) {
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: string(passwordHash), PasswordAlgo: passwordAlgorithmBcrypt, FailedAttemptCount: 1}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	_, err = svc.LoginWithPhonePassword(context.Background(), request.PhonePasswordLoginInput{
 		Phone:    "13800138000",
@@ -519,7 +446,7 @@ func TestLoginWithPhonePasswordLocksAfterMaxFailures(t *testing.T) {
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: string(passwordHash), PasswordAlgo: passwordAlgorithmBcrypt, FailedAttemptCount: 4}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	_, err = svc.LoginWithPhonePassword(context.Background(), request.PhonePasswordLoginInput{
 		Phone:    "13800138000",
@@ -546,7 +473,7 @@ func TestLoginWithPhonePasswordResetsFailuresAfterLockExpires(t *testing.T) {
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: string(passwordHash), PasswordAlgo: passwordAlgorithmBcrypt, FailedAttemptCount: 5, LockedUntil: &expiredLockedUntil}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	_, err = svc.LoginWithPhonePassword(context.Background(), request.PhonePasswordLoginInput{
 		Phone:    "13800138000",
@@ -573,7 +500,7 @@ func TestLoginWithPhonePasswordRejectsLockedCredential(t *testing.T) {
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: string(passwordHash), PasswordAlgo: passwordAlgorithmBcrypt, FailedAttemptCount: 5, LockedUntil: &lockedUntil}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	_, err = svc.LoginWithPhonePassword(context.Background(), request.PhonePasswordLoginInput{
 		Phone:    "13800138000",
@@ -594,7 +521,7 @@ func TestLoginWithPhonePasswordRejectsMissingCredential(t *testing.T) {
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	_, err := svc.LoginWithPhonePassword(context.Background(), request.PhonePasswordLoginInput{
 		Phone:    "13800138000",
@@ -602,6 +529,62 @@ func TestLoginWithPhonePasswordRejectsMissingCredential(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "phone or password is invalid") {
 		t.Fatalf("expected invalid password login error, got %v", err)
+	}
+}
+
+func TestGetSecurityReturnsMaskedPhoneAndPasswordSetup(t *testing.T) {
+	t.Parallel()
+
+	userID := bson.NewObjectID()
+	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
+	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
+	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: "hash", PasswordAlgo: passwordAlgorithmBcrypt}}
+	cfg := validAuthConfig()
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
+
+	security, err := svc.GetSecurity(context.Background(), userID.Hex())
+	if err != nil {
+		t.Fatalf("GetSecurity returned error: %v", err)
+	}
+	if security.Phone != "138****8000" || !security.PasswordSetup {
+		t.Fatalf("unexpected security response: %+v", security)
+	}
+}
+
+func TestGetSecurityReturnsFalseWhenPasswordMissing(t *testing.T) {
+	t.Parallel()
+
+	userID := bson.NewObjectID()
+	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
+	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
+	passwords := &fakeUserPasswordCredentialRepository{}
+	cfg := validAuthConfig()
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
+
+	security, err := svc.GetSecurity(context.Background(), userID.Hex())
+	if err != nil {
+		t.Fatalf("GetSecurity returned error: %v", err)
+	}
+	if security.Phone != "138****8000" || security.PasswordSetup {
+		t.Fatalf("unexpected security response: %+v", security)
+	}
+}
+
+func TestGetSecurityAllowsMissingPhoneIdentity(t *testing.T) {
+	t.Parallel()
+
+	userID := bson.NewObjectID()
+	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
+	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: "hash", PasswordAlgo: passwordAlgorithmBcrypt}}
+	cfg := validAuthConfig()
+	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
+
+	security, err := svc.GetSecurity(context.Background(), userID.Hex())
+	if err != nil {
+		t.Fatalf("GetSecurity returned error: %v", err)
+	}
+	if security.Phone != "" || !security.PasswordSetup {
+		t.Fatalf("unexpected security response: %+v", security)
 	}
 }
 
@@ -613,7 +596,7 @@ func TestSetupPasswordCreatesCredential(t *testing.T) {
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	passwords := &fakeUserPasswordCredentialRepository{}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.SetupPassword(context.Background(), request.SetupPasswordInput{
 		UserID:   userID.Hex(),
@@ -645,7 +628,7 @@ func TestSetupPasswordAllowsConfiguredSpecialCharacters(t *testing.T) {
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	passwords := &fakeUserPasswordCredentialRepository{}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.SetupPassword(context.Background(), request.SetupPasswordInput{
 		UserID:   userID.Hex(),
@@ -668,7 +651,7 @@ func TestSetupPasswordRejectsExistingCredential(t *testing.T) {
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: "hash"}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.SetupPassword(context.Background(), request.SetupPasswordInput{
 		UserID:   userID.Hex(),
@@ -688,7 +671,7 @@ func TestSetupPasswordRejectsMismatchedPhone(t *testing.T) {
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: otherUserID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.SetupPassword(context.Background(), request.SetupPasswordInput{
 		UserID:   userID.Hex(),
@@ -707,7 +690,7 @@ func TestSetupPasswordRejectsWeakPassword(t *testing.T) {
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.SetupPassword(context.Background(), request.SetupPasswordInput{
 		UserID:   userID.Hex(),
@@ -726,7 +709,7 @@ func TestSetupPasswordRejectsLongPassword(t *testing.T) {
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.SetupPassword(context.Background(), request.SetupPasswordInput{
 		UserID:   userID.Hex(),
@@ -745,7 +728,7 @@ func TestSetupPasswordRejectsInvalidPasswordCharacters(t *testing.T) {
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
 	identities := &fakeAuthIdentityRepository{got: &domain.AuthIdentity{UserID: userID, Provider: domain.AuthProviderPhone, Identifier: "+8613800138000", Status: domain.AuthIdentityStatusActive}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, identities, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.SetupPassword(context.Background(), request.SetupPasswordInput{
 		UserID:   userID.Hex(),
@@ -778,7 +761,7 @@ func TestChangePasswordUpdatesCredentialAndRevokesRefreshTokens(t *testing.T) {
 	}}
 	refreshTokens := &fakeRefreshTokenRepository{}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err = svc.ChangePassword(context.Background(), request.ChangePasswordInput{
 		UserID:      userID.Hex(),
@@ -814,7 +797,7 @@ func TestChangePasswordRejectsInvalidOldPassword(t *testing.T) {
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: string(oldPasswordHash), PasswordAlgo: passwordAlgorithmBcrypt}}
 	refreshTokens := &fakeRefreshTokenRepository{}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err = svc.ChangePassword(context.Background(), request.ChangePasswordInput{
 		UserID:      userID.Hex(),
@@ -835,7 +818,7 @@ func TestChangePasswordRejectsMissingCredential(t *testing.T) {
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err := svc.ChangePassword(context.Background(), request.ChangePasswordInput{
 		UserID:      userID.Hex(),
@@ -859,7 +842,7 @@ func TestChangePasswordRejectsSamePassword(t *testing.T) {
 	passwords := &fakeUserPasswordCredentialRepository{got: &domain.UserPasswordCredential{UserID: userID, PasswordHash: string(oldPasswordHash), PasswordAlgo: passwordAlgorithmBcrypt}}
 	refreshTokens := &fakeRefreshTokenRepository{}
 	cfg := validAuthConfig()
-	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingSMSService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg)
+	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, refreshTokens, passwords, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, NewTokenService(cfg.AccessTokenSecret, time.Duration(cfg.AccessTokenTTLSeconds)*time.Second), cfg, "prod")
 
 	err = svc.ChangePassword(context.Background(), request.ChangePasswordInput{
 		UserID:      userID.Hex(),
@@ -877,14 +860,7 @@ func TestChangePasswordRejectsSamePassword(t *testing.T) {
 func TestLoginWithPhoneRejectsWrongCode(t *testing.T) {
 	t.Parallel()
 
-	codes := &fakePhoneCodeRepository{
-		got: &domain.PhoneVerificationCode{
-			ID:       bson.NewObjectID(),
-			Phone:    "+8613800138000",
-			CodeHash: hashPhoneCode("+8613800138000", "123456"),
-		},
-	}
-	svc := newTestAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, codes, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	_, err := svc.LoginWithPhone(context.Background(), request.PhoneLoginInput{Phone: "13800138000", Code: "000000"})
 	if err == nil || !strings.Contains(err.Error(), "phone code is invalid") {
@@ -908,7 +884,7 @@ func TestRefreshRejectsRevokedToken(t *testing.T) {
 		ExpiresAt: time.Now().Add(time.Hour),
 		RevokedAt: &revokedAt,
 	}}
-	svc := NewAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, refreshTokens, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, tokenService, cfg)
+	svc := NewAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, refreshTokens, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, tokenService, cfg, "prod")
 
 	_, err = svc.Refresh(context.Background(), request.RefreshTokenInput{RefreshToken: plain})
 	if err == nil || !strings.Contains(err.Error(), "refresh token is revoked") {
@@ -932,7 +908,7 @@ func TestRefreshReturnsAccessTokenWithoutRotatingRefreshToken(t *testing.T) {
 		TokenHash: hash,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}}
-	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, refreshTokens, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, tokenService, cfg)
+	svc := NewAuthService(users, &fakeAuthIdentityRepository{}, refreshTokens, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, tokenService, cfg, "prod")
 
 	result, err := svc.Refresh(context.Background(), request.RefreshTokenInput{RefreshToken: plain})
 	if err != nil {
@@ -952,7 +928,7 @@ func TestLogoutRevokesRefreshToken(t *testing.T) {
 	cfg := validAuthConfig()
 	tokenService := NewTokenService(cfg.AccessTokenSecret, time.Hour)
 	refreshTokens := &fakeRefreshTokenRepository{}
-	svc := NewAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, refreshTokens, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingSMSService{}, tokenService, cfg)
+	svc := NewAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, refreshTokens, &fakeUserPasswordCredentialRepository{}, &fakeAuthUploadService{}, &recordingPhoneVerificationService{}, tokenService, cfg, "prod")
 
 	if err := svc.Logout(context.Background(), request.LogoutInput{RefreshToken: "refresh"}); err != nil {
 		t.Fatalf("Logout returned error: %v", err)
@@ -976,7 +952,7 @@ func TestDeleteMeDeletesUserAndRevokesAuthState(t *testing.T) {
 	}}
 	identities := &fakeAuthIdentityRepository{}
 	refreshTokens := &fakeRefreshTokenRepository{}
-	svc := newTestAuthService(users, identities, &fakePhoneCodeRepository{}, refreshTokens, &recordingSMSService{})
+	svc := newTestAuthService(users, identities, refreshTokens, &recordingPhoneVerificationService{})
 
 	if err := svc.DeleteMe(context.Background(), userID.Hex()); err != nil {
 		t.Fatalf("DeleteMe returned error: %v", err)
@@ -995,7 +971,7 @@ func TestDeleteMeDeletesUserAndRevokesAuthState(t *testing.T) {
 func TestDeleteMeRejectsInvalidUserID(t *testing.T) {
 	t.Parallel()
 
-	svc := newTestAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(&fakeUserRepository{}, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	err := svc.DeleteMe(context.Background(), "invalid")
 	if err == nil || !strings.Contains(err.Error(), "invalid input") {
@@ -1008,7 +984,7 @@ func TestDeleteMeReturnsUserNotFoundForDeletedUser(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Status: domain.UserStatusDeleted}}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	err := svc.DeleteMe(context.Background(), userID.Hex())
 	if err == nil || !strings.Contains(err.Error(), "user not found") {
@@ -1024,7 +1000,7 @@ func TestDeleteMeReturnsDeleteUserFailure(t *testing.T) {
 		got:       &domain.User{ID: userID, Status: domain.UserStatusCreated},
 		updateErr: errors.New("write failed"),
 	}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	err := svc.DeleteMe(context.Background(), userID.Hex())
 	if err == nil || !strings.Contains(err.Error(), "delete user failed") {
@@ -1038,7 +1014,7 @@ func TestDeleteMeReturnsDisableIdentityFailure(t *testing.T) {
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Status: domain.UserStatusCreated}}
 	identities := &fakeAuthIdentityRepository{err: errors.New("write failed")}
-	svc := newTestAuthService(users, identities, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, identities, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	err := svc.DeleteMe(context.Background(), userID.Hex())
 	if err == nil || !strings.Contains(err.Error(), "disable auth identities failed") {
@@ -1052,7 +1028,7 @@ func TestDeleteMeReturnsRevokeRefreshTokenFailure(t *testing.T) {
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Status: domain.UserStatusCreated}}
 	refreshTokens := &fakeRefreshTokenRepository{err: errors.New("write failed")}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, refreshTokens, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, refreshTokens, &recordingPhoneVerificationService{})
 
 	err := svc.DeleteMe(context.Background(), userID.Hex())
 	if err == nil || !strings.Contains(err.Error(), "revoke refresh tokens failed") {
@@ -1065,7 +1041,7 @@ func TestMeReturnsUser(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	user, err := svc.Me(context.Background(), userID.Hex())
 	if err != nil {
@@ -1081,7 +1057,7 @@ func TestUpdateMyProfileUpdatesUser(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "旧用户名", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	user, err := svc.UpdateMyProfile(context.Background(), userID.Hex(), request.UpdateMyProfileInput{
 		Username: "新用户",
@@ -1112,7 +1088,7 @@ func TestUpdateMyProfileRejectsInvalidGender(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "旧用户名", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	_, err := svc.UpdateMyProfile(context.Background(), userID.Hex(), request.UpdateMyProfileInput{
 		Username: "新用户",
@@ -1131,7 +1107,7 @@ func TestUpdateMyProfileKeepsDefaultAvatarWhenFileMissing(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "旧用户名", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusCreated}}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	user, err := svc.UpdateMyProfile(context.Background(), userID.Hex(), request.UpdateMyProfileInput{
 		Username: "新用户",
@@ -1157,7 +1133,7 @@ func TestMeRejectsDeletedUser(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusDeleted}}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	_, err := svc.Me(context.Background(), userID.Hex())
 	if err == nil || !strings.Contains(err.Error(), "user not found") {
@@ -1170,7 +1146,7 @@ func TestMeRejectsDisabledUser(t *testing.T) {
 
 	userID := bson.NewObjectID()
 	users := &fakeUserRepository{got: &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: defaultUserAvatarObjectKey}, Status: domain.UserStatusDisabled}}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakePhoneCodeRepository{}, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	_, err := svc.Me(context.Background(), userID.Hex())
 	if err == nil || !strings.Contains(err.Error(), "user is disabled") {
@@ -1181,15 +1157,8 @@ func TestMeRejectsDisabledUser(t *testing.T) {
 func TestLoginWithPhoneWrapsCreateUserFailure(t *testing.T) {
 	t.Parallel()
 
-	codes := &fakePhoneCodeRepository{
-		got: &domain.PhoneVerificationCode{
-			ID:       bson.NewObjectID(),
-			Phone:    "+8613800138000",
-			CodeHash: hashPhoneCode("+8613800138000", "123456"),
-		},
-	}
 	users := &fakeUserRepository{err: errors.New("database down")}
-	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, codes, &fakeRefreshTokenRepository{}, &recordingSMSService{})
+	svc := newTestAuthService(users, &fakeAuthIdentityRepository{}, &fakeRefreshTokenRepository{}, &recordingPhoneVerificationService{})
 
 	_, err := svc.LoginWithPhone(context.Background(), request.PhoneLoginInput{Phone: "13800138000", Code: "123456"})
 	if err == nil || !strings.Contains(err.Error(), "create user failed") {

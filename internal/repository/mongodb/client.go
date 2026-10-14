@@ -85,16 +85,6 @@ func ensureIndexes(ctx context.Context, db *mongo.Database) error {
 		return err
 	}
 
-	if _, err := db.Collection(phoneVerificationCodeCollectionName).Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "ph", Value: 1},
-			{Key: "pur", Value: 1},
-			{Key: "cat", Value: -1},
-		},
-	}); err != nil {
-		return err
-	}
-
 	return nil
 }
 

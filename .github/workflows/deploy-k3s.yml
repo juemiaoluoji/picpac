@@ -1,0 +1,170 @@
+name: Deploy to k3s
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
+      platform:
+        type: string
+        default: linux/amd64
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_PRIVATE_KEY:
+        required: true
+      SSH_KNOWN_HOSTS:
+        required: true
+      TCR_USERNAME:
+        required: true
+      TCR_PASSWORD:
+        required: true
+      PICPAC_CONFIG_OVERRIDES:
+        required: false
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Existing published image address (no rebuild required)
+        required: true
+        type: string
+      platform:
+        type: choice
+        options: [linux/amd64, linux/arm64]
+        default: linux/amd64
+  pull_request:
+    branches: [main]
+    paths:
+      - deploy/**
+      - .github/workflows/**
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check deployment script
+        run: bash -n deploy/deploy-k3s.sh
+      - name: Test first deployment and image updates
+        run: python3 -m unittest discover -s deploy/tests -v
+
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: deploy-k3s-picpac
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Deploy over SSH
+        env:
+          IMAGE: ${{ inputs.image }}
+          PLATFORM: ${{ inputs.platform }}
+          TCR_IMAGE: ${{ vars.TCR_IMAGE }}
+          TCR_USERNAME: ${{ secrets.TCR_USERNAME }}
+          TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
+          PICPAC_CONFIG_OVERRIDES: ${{ secrets.PICPAC_CONFIG_OVERRIDES }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.SSH_PORT || '22' }}
+          CONFIG_PATH: ${{ vars.K3S_CONFIG_PATH || '/etc/picpac/config.json' }}
+          NODE_PORT: ${{ vars.K3S_NODE_PORT || '32090' }}
+          MONGO_NODE_PORT: ${{ vars.MONGO_NODE_PORT || '32017' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in SSH_HOST SSH_USER SSH_PRIVATE_KEY SSH_KNOWN_HOSTS TCR_IMAGE TCR_USERNAME TCR_PASSWORD; do
+            if [[ -z "${!value}" ]]; then
+              echo "::error::Missing repository configuration: $value"
+              exit 1
+            fi
+          done
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { echo '::error::Invalid SSH_HOST'; exit 1; }
+          [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo '::error::Invalid SSH_USER'; exit 1; }
+          [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$SSH_PORT > 0 && 10#$SSH_PORT < 65536 )) || { echo '::error::Invalid SSH_PORT'; exit 1; }
+          [[ "$CONFIG_PATH" =~ ^/[a-zA-Z0-9._/-]+$ ]] || { echo '::error::K3S_CONFIG_PATH must be an absolute path without spaces'; exit 1; }
+          [[ "$IMAGE" == "$TCR_IMAGE":* ]] || { echo '::error::The image must belong to TCR_IMAGE'; exit 1; }
+          case "$PLATFORM" in linux/amd64|linux/arm64) ;; *) echo '::error::Unsupported platform'; exit 1 ;; esac
+
+          ssh_dir="$(mktemp -d "$RUNNER_TEMP/picpac-ssh.XXXXXX")"
+          remote_dir=""
+          target="${SSH_USER}@${SSH_HOST}"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$ssh_dir/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" | tr -d '\r' > "$ssh_dir/known_hosts"
+          chmod 600 "$ssh_dir/key" "$ssh_dir/known_hosts"
+          ssh-keygen -y -P '' -f "$ssh_dir/key" >/dev/null
+          ssh_options=(-i "$ssh_dir/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$ssh_dir/known_hosts" -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+          cleanup() {
+            if [[ "$remote_dir" =~ ^/tmp/picpac-deploy\.[a-zA-Z0-9]+$ ]]; then
+              ssh "${ssh_options[@]}" -p "$SSH_PORT" "$target" "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+            fi
+            rm -rf -- "$ssh_dir"
+          }
+          trap cleanup EXIT
+
+          # The config is copied on every deployment; it need not exist yet.
+          preflight='sudo -n -i test -x /usr/local/bin/k3s'
+          ssh "${ssh_options[@]}" -p "$SSH_PORT" "$target" "$preflight" || {
+            echo '::error::SSH/sudo preflight failed. Check connectivity and passwordless sudo.'
+            exit 1
+          }
+          remote_dir="$(ssh "${ssh_options[@]}" -p "$SSH_PORT" "$target" 'umask 077; mktemp -d /tmp/picpac-deploy.XXXXXX')"
+          [[ "$remote_dir" =~ ^/tmp/picpac-deploy\.[a-zA-Z0-9]+$ ]] || { echo '::error::Invalid remote temporary directory'; exit 1; }
+
+          export REGISTRY="${TCR_IMAGE%%/*}" CREDENTIAL_FILE="$ssh_dir/tcr.json"
+          python3 - <<'PY'
+          import base64, json, os
+          from pathlib import Path
+          auth = base64.b64encode((os.environ['TCR_USERNAME'] + ':' + os.environ['TCR_PASSWORD']).encode()).decode()
+          Path(os.environ['CREDENTIAL_FILE']).write_text(json.dumps({'auths': {os.environ['REGISTRY']: {'auth': auth}}}))
+          PY
+          export CONFIG_OUTPUT="$ssh_dir/config.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.parse import urlsplit, unquote
+          config = json.loads(Path('config.json').read_text(encoding='utf-8-sig'))
+          overrides = json.loads(os.environ.get('PICPAC_CONFIG_OVERRIDES') or '{}')
+          if not isinstance(overrides, dict):
+              raise SystemExit('PICPAC_CONFIG_OVERRIDES must be a JSON object.')
+          def merge(target, values):
+              for key, value in values.items():
+                  if isinstance(value, dict):
+                      if not isinstance(target.get(key), dict):
+                          target[key] = {}
+                      merge(target[key], value)
+                  else:
+                      target[key] = value
+                      if isinstance(value, str) and value:
+                          mask = value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                          print('::add-mask::' + mask)
+                          if key == 'uri' and value.startswith(('mongodb://', 'mongodb+srv://')):
+                              parsed = urlsplit(value)
+                              for credential in [parsed.username, parsed.password]:
+                                  if credential:
+                                      print('::add-mask::' + unquote(credential).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          merge(config, overrides)
+          Path(os.environ['CONFIG_OUTPUT']).write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
+          PY
+          chmod 600 "$ssh_dir/tcr.json"
+          chmod 600 "$ssh_dir/config.json"
+          scp "${ssh_options[@]}" -P "$SSH_PORT" deploy/deploy-k3s.sh deploy/prepare-config.py deploy/picpac.yaml "$ssh_dir/tcr.json" "$ssh_dir/config.json" "$target:$remote_dir/"
+          printf -v command 'sudo -n -i bash %q %q %q %q %q %q %q %q %q' \
+            "$remote_dir/deploy-k3s.sh" "$IMAGE" "$CONFIG_PATH" "$PLATFORM" "$NODE_PORT" "$remote_dir/tcr.json" "$remote_dir/picpac.yaml" "$remote_dir/config.json" "$MONGO_NODE_PORT"
+          ssh "${ssh_options[@]}" -p "$SSH_PORT" "$target" "$command"
+          printf 'Deployed `%s` to k3s namespace `picpac`. NodePort: `%s`.\n' "$IMAGE" "$NODE_PORT" >> "$GITHUB_STEP_SUMMARY"
