@@ -11,7 +11,7 @@
 - 推送成功后调用 `Deploy to k3s` 工作流，使用 SSH 登录服务器，通过 `sudo -n -i` 执行部署。
 - `picpac` 命名空间没有 `picpac` Deployment 时创建；存在时更新名为 `picpac` 的容器镜像和配置挂载，保留现有副本数、资源设置、其他容器和 Service。
 - 没有 Service 时创建 NodePort Service：默认外部端口 32090，目标端口读取运行配置，当前为 9090。
-- 每次部署将服务器配置同步到 `picpac-config` Secret，将 TCR 拉取凭证同步到 `tcr-pull` Secret。配置内容变化时会触发 Pod 更新。
+- 每次部署从仓库读取 `config.json`，叠加 `PICPAC_CONFIG_OVERRIDES` 的运行凭证，自动写入服务器指定路径，再同步到 `picpac-config` Secret。TCR 拉取凭证同步到 `tcr-pull` Secret；配置内容变化时触发 Pod 更新。
 - 等待 Deployment 就绪，失败时工作流报错，不自动删除工作负载、不自动回滚数据库。
 - PR 只做构建和部署脚本检查，不能推镜像或部署服务器。
 - 全部 TCR 配置为空时仅验证构建。手动运行可保持 `publish=false`；需要只推镜像时设置 `publish=true`、`deploy=false`。
@@ -25,12 +25,14 @@
 | Variable | `TCR_IMAGE` | 完整仓库路径，不带协议和标签，当前为 `ccr.ccs.tencentyun.com/picpac/server` |
 | Secret | `TCR_USERNAME` | TCR 登录指引中的账号 ID |
 | Secret | `TCR_PASSWORD` | TCR 个人版访问密码 |
+| Secret | `PICPAC_CONFIG_OVERRIDES` | 运行配置覆写 JSON；例如包含 `mongo.uri` 与 `auth.access_token_secret` 的真实值，不能放到代码仓库 |
 | Secret | `SSH_HOST` | k3s 服务器公网地址 |
 | Secret | `SSH_USER` | 已绑定密钥的账号，例如 ubuntu；必须可免交互提权 |
 | Secret | `SSH_PRIVATE_KEY` | PEM 私钥完整内容，保留首尾标记和换行 |
 | Secret | `SSH_KNOWN_HOSTS` | 经核验的服务器 SSH 主机公钥记录；不能通过关闭 StrictHostKeyChecking 代替 |
 | Variable | `K3S_CONFIG_PATH` | 服务器上的生产配置文件，当前为 `/picpac/config/config.json`；默认 `/etc/picpac/config.json` |
 | Variable，可选 | `K3S_NODE_PORT` | 首次创建 Service 的 NodePort，默认 `32090`，范围 30000–32767 |
+| Variable，可选 | `MONGO_NODE_PORT` | 当仓库 Mongo URI 使用环回地址时，用该 NodePort 查找实际 Mongo Service；默认 `32017` |
 | Variable，可选 | `SSH_PORT` | SSH 监听端口，默认 `22` |
 | Variable，可选 | `TKE_PLATFORM` | 保留原构建变量名，默认 `linux/amd64`；ARM 节点使用 `linux/arm64` |
 
@@ -40,19 +42,20 @@
 
 1. 保证 GitHub runner 能连接 SSH 端口。GitHub 托管 runner 出口 IP 不固定，仅允许个人电脑来源 IP 时，它无法直接 SSH 部署。
 2. 在目标登录账号下验证 `sudo -n -i /usr/local/bin/k3s kubectl get nodes`。该命令必须无需密码、无需交互；流水线不修改 sudo 权限。
-3. 将真实生产 `config.json` 保存到 `K3S_CONFIG_PATH` 指定位置，建议文件权限 600，仅管理员读取。不要将真实运行配置提交到 Git。
-4. Mongo URI 必须使用 Mongo 的 Service 地址或可达内网地址；应用 Pod 中的 localhost/127.0.0.1 不是节点 Mongo，部署会在修改集群前拒绝这种配置。保留你已有的数据库和副本集，不重新部署 Mongo。
+3. 配置 `PICPAC_CONFIG_OVERRIDES` 后，服务器无需提前创建 JSON；每次部署会自动创建或覆盖 `K3S_CONFIG_PATH`，权限为 600。真实凭证不能提交到 Git，也不能直接用仓库占位值部署。
+4. Mongo URI 应使用 Service 地址或可达内网地址。若输入仍是 localhost/127.0.0.1，脚本会查找唯一一个 NodePort 32017 对应的 Mongo Service，并转换成集群 DNS 地址，保留账号、数据库及副本集参数；找不到时明确失败。不会修改已有 Mongo Service 或数据。
 5. 为外部访问在**实例防火墙**放行 TCP 32090。修改模板不会自动修改既有实例规则。SSH 的 22 与 Mongo 的 32017 各有独立用途。
 
 配置流向为：
 
 ```text
-服务器 /picpac/config/config.json
+仓库 config.json + GitHub Secret PICPAC_CONFIG_OVERRIDES
+  → 服务器 /picpac/config/config.json（自动写入）
   → k3s Secret picpac-config
   → 容器 /app/config/config.json
 ```
 
-镜像已设置 `PICPAC_CONFIG` 指向挂载文件，`category.json` 位于 `/app/category.json`。Secret 文件权限为 0444，容器用户 10001 可读。旧 Pod 的 subPath 配置不会直接热更新；部署使用配置校验值触发新 Pod。修改已有应用端口时，要同步调整已有 Deployment 和 Service。
+运行配置会转换为无 BOM 的 UTF-8 JSON，仓库中的敏感占位值必须由 Secret 覆盖。镜像已设置 `PICPAC_CONFIG` 指向挂载文件，`category.json` 位于 `/app/category.json`。Secret 文件权限为 0444，容器用户 10001 可读。旧 Pod 的 subPath 配置不会直接热更新；部署使用配置校验值触发新 Pod。修改已有应用端口时，要同步调整已有 Deployment 和 Service。
 
 ## 手动重试部署，不重新构建镜像
 

@@ -41,6 +41,10 @@ printf '%s ' "$@" >> "$FAKE_CALLS"
 printf '\\n' >> "$FAKE_CALLS"
 args="$*"
 case "$args" in
+  *'get services -A -o json'*)
+    if [[ "${FAKE_MONGO_SERVICE:-0}" == 1 ]]; then
+      echo '{"items":[{"metadata":{"name":"mongodb","namespace":"data"},"spec":{"ports":[{"port":27017,"nodePort":32017}]}}]}'
+    else echo '{"items":[]}'; fi ;;
   *'get deployment picpac --ignore-not-found'*)
     if [[ "${FAKE_EXISTING:-0}" == 1 ]]; then echo deployment.apps/picpac; fi ;;
   *'get service picpac --ignore-not-found'*)
@@ -73,13 +77,16 @@ esac
         if not self.bash:
             self.skipTest("bash is required")
 
-    def run_deploy(self, image=IMAGE, node_port="32090"):
-        return subprocess.run([
+    def run_deploy(self, image=IMAGE, node_port="32090", incoming=None, destination=None):
+        args = [
             self.bash, "-c", 'export PATH="$MOCK_BIN:$PATH"; exec bash "$@"', "test-deploy",
             (ROOT / "deploy/deploy-k3s.sh").as_posix(),
-            image, self.config.as_posix(), "linux/amd64", node_port,
+            image, destination or self.config.as_posix(), "linux/amd64", node_port,
             self.credentials.as_posix(), (ROOT / "deploy/picpac.yaml").as_posix(),
-        ], env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        ]
+        if incoming:
+            args.extend([incoming, "32017"])
+        return subprocess.run(args, env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     def test_first_deployment_creates_workload_and_service(self):
         result = self.run_deploy()
@@ -118,7 +125,7 @@ esac
                 result = self.run_deploy()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("loopback", result.stderr)
-                self.assertFalse(self.calls.exists())
+                self.assertNotIn("apply", self.calls.read_text())
 
     def test_invalid_image_and_nodeport_are_rejected(self):
         for image, port in [(IMAGE + ";whoami", "32090"), (IMAGE, "22")]:
@@ -149,6 +156,43 @@ esac
         result = self.run_deploy()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.config.read_bytes(), b'\xef\xbb\xbf' + content)
+
+    def test_repository_config_replaces_invalid_server_file(self):
+        destination = self.work / "server-config.json"
+        destination.write_text("invalid old config")
+        shell_path = destination.as_posix()
+        if os.name == "nt":
+            shell_path = "/" + shell_path[0].lower() + shell_path[2:]
+        result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(destination.read_text()), json.loads(self.config.read_text()))
+
+    def test_loopback_mongo_resolves_only_the_selected_service(self):
+        self.env["FAKE_MONGO_SERVICE"] = "1"
+        self.config.write_text(json.dumps({
+            "server": {"port": "9090"},
+            "mongo": {"uri": "mongodb://localhost:32017/picpac?replicaSet=rs0"},
+        }))
+        destination = self.work / "server-config.json"
+        shell_path = destination.as_posix()
+        if os.name == "nt":
+            shell_path = "/" + shell_path[0].lower() + shell_path[2:]
+        result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(destination.read_text())
+        self.assertEqual(config["mongo"]["uri"], "mongodb://mongodb.data.svc.cluster.local:27017/picpac?replicaSet=rs0")
+
+    def test_repository_credential_placeholders_are_not_deployed(self):
+        placeholder = "\u5077apikey\u7684\u66ff\u6211\u6321\u707e"
+        self.config.write_text(json.dumps({
+            "server": {"port": "9090"},
+            "mongo": {"uri": "mongodb://mongo.example:27017/picpac"},
+            "auth": {"access_token_secret": placeholder},
+        }))
+        result = self.run_deploy()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repository placeholders", result.stderr)
+        self.assertFalse(self.calls.exists())
 
     def test_failed_rollout_is_reported_as_failure(self):
         self.env["FAKE_ROLLOUT_EXIT"] = "1"

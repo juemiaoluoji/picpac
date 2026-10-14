@@ -8,6 +8,8 @@ platform="${3:?platform is required}"
 node_port="${4:?NodePort is required}"
 credentials_file="${5:?registry credentials file is required}"
 template_file="${6:?deployment template is required}"
+incoming_config="${7:-}"
+mongo_node_port="${8:-32017}"
 k3s_bin="${K3S_BIN:-/usr/local/bin/k3s}"
 python_bin="${PYTHON_BIN:-python3}"
 
@@ -19,7 +21,8 @@ case "$platform" in
   *) echo 'Unsupported platform.' >&2; exit 1 ;;
 esac
 [[ "$node_port" =~ ^[0-9]{5}$ ]] && (( 10#$node_port >= 30000 && 10#$node_port <= 32767 )) || { echo 'NodePort must be between 30000 and 32767.' >&2; exit 1; }
-[[ -r "$config_file" && -r "$credentials_file" && -r "$template_file" ]] || { echo 'Config, credentials or deployment template is missing.' >&2; exit 1; }
+config_source="${incoming_config:-$config_file}"
+[[ -r "$config_source" && -r "$credentials_file" && -r "$template_file" ]] || { echo 'Config, credentials or deployment template is missing.' >&2; exit 1; }
 [[ -x "$k3s_bin" ]] || { echo 'k3s executable was not found.' >&2; exit 1; }
 
 # kube uses k3s's root-owned admin kubeconfig, without exposing it to GitHub.
@@ -28,8 +31,9 @@ kube() { "$k3s_bin" kubectl "$@"; }
 work_dir="$(mktemp -d /tmp/picpac-k3s.XXXXXX)"
 trap 'rm -rf -- "$work_dir"' EXIT
 runtime_config="$work_dir/config.json"
-port="$("$python_bin" - "$config_file" "$runtime_config" <<'PY'
+port="$("$python_bin" - "$config_source" "$runtime_config" <<'PY'
 import json, re, sys
+from urllib.parse import unquote
 try:
     with open(sys.argv[1], encoding='utf-8-sig') as stream:
         config = json.load(stream)
@@ -51,16 +55,60 @@ if not isinstance(mongo, dict):
 uri = mongo.get('uri')
 if not isinstance(uri, str) or not uri.startswith(('mongodb://', 'mongodb+srv://')):
     sys.exit('config.json mongo.uri must start with mongodb:// or mongodb+srv://.')
+placeholder = '\u5077apikey\u7684\u66ff\u6211\u6321\u707e'
+auth = config.get('auth', {})
+if placeholder in unquote(uri) or (isinstance(auth, dict) and auth.get('access_token_secret') == placeholder):
+    sys.exit('Runtime Mongo/JWT credentials still contain repository placeholders. Configure PICPAC_CONFIG_OVERRIDES before deployment.')
 hosts = uri.split('://', 1)[1].split('/', 1)[0].rsplit('@', 1)[-1]
 if not hosts:
     sys.exit('config.json mongo.uri must include a host.')
-if re.search(r'(^|,)(localhost|127\.[0-9.]+|\[::1\])(?=[:,?]|$)', hosts, re.I):
-    sys.exit('Mongo URI uses loopback. Use the Mongo Service address or a reachable private address.')
 with open(sys.argv[2], 'w', encoding='utf-8') as stream:
     json.dump(config, stream, ensure_ascii=False)
 print(int(port))
 PY
 )"
+needs_mongo_service="$("$python_bin" - "$runtime_config" <<'PY'
+import json, re, sys
+with open(sys.argv[1], encoding='utf-8') as stream:
+    uri = json.load(stream)['mongo']['uri']
+hosts = uri.split('://', 1)[1].split('/', 1)[0].rsplit('@', 1)[-1]
+print('yes' if re.search(r'(^|,)(localhost|127\.[0-9.]+|\[::1\])(?=[:,?]|$)', hosts, re.I) else 'no')
+PY
+)"
+if [[ "$needs_mongo_service" == yes ]]; then
+  [[ "$mongo_node_port" =~ ^[0-9]{5}$ ]] || { echo 'Invalid Mongo NodePort.' >&2; exit 1; }
+  kube get services -A -o json > "$work_dir/services.json"
+  "$python_bin" - "$runtime_config" "$work_dir/services.json" "$mongo_node_port" <<'PY'
+import json, sys
+from urllib.parse import urlsplit, urlunsplit
+with open(sys.argv[1], encoding='utf-8') as stream:
+    config = json.load(stream)
+with open(sys.argv[2], encoding='utf-8') as stream:
+    services = json.load(stream)
+matches = [(service, port) for service in services.get('items', [])
+           for port in service.get('spec', {}).get('ports', [])
+           if port.get('nodePort') == int(sys.argv[3])]
+if len(matches) != 1:
+    sys.exit('Mongo URI uses loopback and no unique Mongo Service matches MONGO_NODE_PORT. Configure a reachable mongo.uri override.')
+service, port = matches[0]
+host = f"{service['metadata']['name']}.{service['metadata']['namespace']}.svc.cluster.local:{port['port']}"
+parsed = urlsplit(config['mongo']['uri'])
+credentials, separator, _ = parsed.netloc.rpartition('@')
+netloc = (credentials + '@' if separator else '') + host
+config['mongo']['uri'] = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+with open(sys.argv[1], 'w', encoding='utf-8') as stream:
+    json.dump(config, stream, ensure_ascii=False)
+print('Mongo endpoint uses its in-cluster Service: ' + host)
+PY
+fi
+if [[ -n "$incoming_config" ]]; then
+  [[ "$config_file" == /* ]] || { echo 'Config destination must be an absolute server path.' >&2; exit 1; }
+  mkdir -p -- "$(dirname "$config_file")"
+  staged_config="$(mktemp "${config_file}.XXXXXX")"
+  install -m 600 "$runtime_config" "$staged_config"
+  mv -f -- "$staged_config" "$config_file"
+  echo 'Synchronized repository config and runtime overrides to the server.'
+fi
 config_sha="$(sha256sum "$runtime_config" | cut -d ' ' -f1)"
 
 kube get nodes >/dev/null
