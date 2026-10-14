@@ -30,15 +30,27 @@ import json, re, sys
 try:
     with open(sys.argv[1], encoding='utf-8') as stream:
         config = json.load(stream)
-    port = str(config['server']['port'])
-    if not re.fullmatch(r'[0-9]{1,5}', port) or not 1 <= int(port) <= 65535:
-        raise ValueError()
-    uri = config['mongo']['uri']
-    if not isinstance(uri, str) or not uri.startswith(('mongodb://', 'mongodb+srv://')):
-        raise ValueError()
-    hosts = uri.split('://', 1)[1].split('/', 1)[0].rsplit('@', 1)[-1]
-except (OSError, ValueError, KeyError, TypeError, IndexError):
-    sys.exit('Invalid config.json: check JSON, server.port and mongo.uri.')
+except json.JSONDecodeError as error:
+    sys.exit(f'config.json is not valid JSON (line {error.lineno}, column {error.colno}). Save it as UTF-8 without BOM.')
+except (OSError, UnicodeDecodeError):
+    sys.exit('config.json must be a readable UTF-8 JSON file.')
+if not isinstance(config, dict):
+    sys.exit('config.json must contain a JSON object.')
+server = config.get('server')
+if not isinstance(server, dict):
+    sys.exit('config.json is missing the server object.')
+port = server.get('port')
+if not isinstance(port, str) or not re.fullmatch(r'[0-9]{1,5}', port) or not 1 <= int(port) <= 65535:
+    sys.exit('config.json server.port must be a numeric string, for example "9090".')
+mongo = config.get('mongo')
+if not isinstance(mongo, dict):
+    sys.exit('config.json is missing the mongo object.')
+uri = mongo.get('uri')
+if not isinstance(uri, str) or not uri.startswith(('mongodb://', 'mongodb+srv://')):
+    sys.exit('config.json mongo.uri must start with mongodb:// or mongodb+srv://.')
+hosts = uri.split('://', 1)[1].split('/', 1)[0].rsplit('@', 1)[-1]
+if not hosts:
+    sys.exit('config.json mongo.uri must include a host.')
 if re.search(r'(^|,)(localhost|127\.[0-9.]+|\[::1\])(?=[:,?]|$)', hosts, re.I):
     sys.exit('Mongo URI uses loopback. Use the Mongo Service address or a reachable private address.')
 print(int(port))

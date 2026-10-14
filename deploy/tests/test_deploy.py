@@ -127,6 +127,22 @@ esac
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.calls.exists())
 
+    def test_config_errors_report_fields_without_printing_values(self):
+        for config, message in [
+            ([], "JSON object"),
+            ({}, "server object"),
+            ({"server": {"port": 9090}}, "server.port"),
+            ({"server": {"port": "9090"}}, "mongo object"),
+            ({"server": {"port": "9090"}, "mongo": {"uri": "private-value"}}, "mongo.uri"),
+        ]:
+            with self.subTest(message=message):
+                self.config.write_text(json.dumps(config))
+                result = self.run_deploy()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("private-value", result.stderr)
+                self.assertFalse(self.calls.exists())
+
     def test_failed_rollout_is_reported_as_failure(self):
         self.env["FAKE_ROLLOUT_EXIT"] = "1"
         result = self.run_deploy()
