@@ -143,6 +143,13 @@ esac
                 self.assertNotIn("private-value", result.stderr)
                 self.assertFalse(self.calls.exists())
 
+    def test_utf8_bom_is_normalized_without_changing_source(self):
+        content = self.config.read_bytes()
+        self.config.write_bytes(b'\xef\xbb\xbf' + content)
+        result = self.run_deploy()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.config.read_bytes(), b'\xef\xbb\xbf' + content)
+
     def test_failed_rollout_is_reported_as_failure(self):
         self.env["FAKE_ROLLOUT_EXIT"] = "1"
         result = self.run_deploy()

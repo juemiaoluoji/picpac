@@ -25,13 +25,16 @@ esac
 # kube uses k3s's root-owned admin kubeconfig, without exposing it to GitHub.
 kube() { "$k3s_bin" kubectl "$@"; }
 
-port="$("$python_bin" - "$config_file" <<'PY'
+work_dir="$(mktemp -d /tmp/picpac-k3s.XXXXXX)"
+trap 'rm -rf -- "$work_dir"' EXIT
+runtime_config="$work_dir/config.json"
+port="$("$python_bin" - "$config_file" "$runtime_config" <<'PY'
 import json, re, sys
 try:
-    with open(sys.argv[1], encoding='utf-8') as stream:
+    with open(sys.argv[1], encoding='utf-8-sig') as stream:
         config = json.load(stream)
 except json.JSONDecodeError as error:
-    sys.exit(f'config.json is not valid JSON (line {error.lineno}, column {error.colno}). Save it as UTF-8 without BOM.')
+    sys.exit(f'config.json is not valid JSON: {error.msg} (line {error.lineno}, column {error.colno}).')
 except (OSError, UnicodeDecodeError):
     sys.exit('config.json must be a readable UTF-8 JSON file.')
 if not isinstance(config, dict):
@@ -53,12 +56,12 @@ if not hosts:
     sys.exit('config.json mongo.uri must include a host.')
 if re.search(r'(^|,)(localhost|127\.[0-9.]+|\[::1\])(?=[:,?]|$)', hosts, re.I):
     sys.exit('Mongo URI uses loopback. Use the Mongo Service address or a reachable private address.')
+with open(sys.argv[2], 'w', encoding='utf-8') as stream:
+    json.dump(config, stream, ensure_ascii=False)
 print(int(port))
 PY
 )"
-config_sha="$(sha256sum "$config_file" | cut -d ' ' -f1)"
-work_dir="$(mktemp -d /tmp/picpac-k3s.XXXXXX)"
-trap 'rm -rf -- "$work_dir"' EXIT
+config_sha="$(sha256sum "$runtime_config" | cut -d ' ' -f1)"
 
 kube get nodes >/dev/null
 kube create namespace picpac --dry-run=client -o yaml | kube apply -f -
@@ -66,7 +69,7 @@ kube -n picpac create secret generic tcr-pull \
   --type=kubernetes.io/dockerconfigjson --from-file=".dockerconfigjson=$credentials_file" \
   --dry-run=client -o yaml | kube apply -f -
 kube -n picpac create secret generic picpac-config \
-  --from-file="config.json=$config_file" --dry-run=client -o yaml | kube apply -f -
+  --from-file="config.json=$runtime_config" --dry-run=client -o yaml | kube apply -f -
 
 existing="$(kube -n picpac get deployment picpac --ignore-not-found -o name)"
 if [[ -z "$existing" ]]; then
