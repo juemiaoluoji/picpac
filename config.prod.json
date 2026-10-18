@@ -29,7 +29,6 @@
     "max_pool_size": 20
   },
   "auth": {
-    "access_token_secret": "${JWT_SECRET}",
     "access_token_ttl_seconds": 7200,
     "refresh_token_ttl_seconds": 2592000,
     "phone_code": {

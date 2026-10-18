@@ -86,7 +86,7 @@ class RenderConfigTests(unittest.TestCase):
         config = self.render({"MONGO_PASSWORD": "test-only-password"})
         self.assertEqual(config["mongo"]["service"], "mongo.picpac.svc.cluster.local")
         self.assertEqual(config["mongo"]["password"], "test-only-password")
-        self.assertEqual(config["auth"]["access_token_secret"], RENDERER.PLACEHOLDER)
+        self.assertNotIn("access_token_secret", config["auth"])
         self.assertEqual(config["oss"]["access_key_id"], RENDERER.PLACEHOLDER)
         self.assertEqual(config["dashscope"]["api_key"], RENDERER.PLACEHOLDER)
         self.assertEqual(config["auth"]["phone_code"]["security_token"], "")
@@ -114,6 +114,10 @@ class RenderConfigTests(unittest.TestCase):
             self.assertEqual(config["mongo"]["uri"], "mongodb://admin:test-only-password@mongo.picpac.svc.cluster.local:27017/picpac?authSource=admin")
             self.assertEqual(set(config["mongo"]), {"uri", "database", "connect_timeout_seconds", "max_pool_size"})
             self.assertGreater(len(config["auth"]["access_token_secret"]), 40)
+            saved.write_bytes(output.read_bytes())
+            with redirect_stdout(io.StringIO()):
+                PREPARER.prepare(source, output, saved)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["auth"]["access_token_secret"], config["auth"]["access_token_secret"])
 
 
 if __name__ == "__main__":
