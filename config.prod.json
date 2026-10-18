@@ -1,0 +1,56 @@
+{
+  "env": "prod",
+  "server": { "port": "9090" },
+  "oss": {
+    "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
+    "bucket_name": "picpac",
+    "access_key_id": "偷apikey的替我挡灾",
+    "access_key_secret": "偷apikey的替我挡灾",
+    "public_base_url": "https://picpac.oss-cn-shanghai.aliyuncs.com",
+    "signed_url_ttl_seconds": 86400
+  },
+  "dashscope": {
+    "api_key": "偷apikey的替我挡灾",
+    "image_model": "qwen-image-2.0"
+  },
+  "deepseek": {
+    "api_key": "偷apikey的替我挡灾",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1/chat/completions"
+  },
+  "mongo": {
+    "service": "${MONGO_SERVICE}",
+    "port": "${MONGO_PORT}",
+    "username": "${MONGO_USERNAME}",
+    "password": "偷apikey的替我挡灾",
+    "database": "${MONGO_DATABASE}",
+    "options": { "authSource": "${MONGO_AUTH_SOURCE}" },
+    "connect_timeout_seconds": 10,
+    "max_pool_size": 20
+  },
+  "auth": {
+    "access_token_secret": "偷apikey的替我挡灾",
+    "access_token_ttl_seconds": 7200,
+    "refresh_token_ttl_seconds": 2592000,
+    "phone_code": {
+      "access_key_id": "偷apikey的替我挡灾",
+      "access_key_secret": "偷apikey的替我挡灾",
+      "security_token": "偷apikey的替我挡灾",
+      "scheme_name": "${SMS_SCHEME_NAME}",
+      "sign_name": "${SMS_SIGN_NAME}",
+      "template_code": "${SMS_TEMPLATE_CODE}",
+      "request_timeout_seconds": 10,
+      "valid_time_seconds": 300,
+      "interval_seconds": 60,
+      "duplicate_policy": 1,
+      "dev_fixed_code": "123456"
+    }
+  },
+  "cors": {
+    "allowed_origins": [
+      "http://localhost:54771",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000"
+    ]
+  }
+}

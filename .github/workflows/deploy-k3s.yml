@@ -22,7 +22,23 @@ on:
         required: true
       TCR_PASSWORD:
         required: true
-      PICPAC_CONFIG_OVERRIDES:
+      MONGO_PASSWORD:
+        required: false
+      JWT_SECRET:
+        required: false
+      OSS_ACCESS_KEY_ID:
+        required: false
+      OSS_ACCESS_KEY_SECRET:
+        required: false
+      DEEPSEEK_API_KEY:
+        required: false
+      DASHSCOPE_API_KEY:
+        required: false
+      SMS_ACCESS_KEY_ID:
+        required: false
+      SMS_ACCESS_KEY_SECRET:
+        required: false
+      SMS_SECURITY_TOKEN:
         required: false
   workflow_dispatch:
     inputs:
@@ -39,6 +55,7 @@ on:
     paths:
       - deploy/**
       - .github/workflows/**
+      - config.prod.json
 
 permissions:
   contents: read
@@ -55,6 +72,11 @@ jobs:
         run: bash -n deploy/deploy-k3s.sh
       - name: Test first deployment and image updates
         run: python3 -m unittest discover -s deploy/tests -v
+      - name: Validate production template
+        env:
+          MONGO_DATABASE: picpac
+          MONGO_AUTH_SOURCE: admin
+        run: python3 deploy/render-config.py config.prod.json "$RUNNER_TEMP/config.json"
 
   deploy:
     needs: validate
@@ -75,15 +97,30 @@ jobs:
           TCR_IMAGE: ${{ vars.TCR_IMAGE }}
           TCR_USERNAME: ${{ secrets.TCR_USERNAME }}
           TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
-          PICPAC_CONFIG_OVERRIDES: ${{ secrets.PICPAC_CONFIG_OVERRIDES }}
+          MONGO_SERVICE: ${{ vars.MONGO_SERVICE }}
+          MONGO_PORT: ${{ vars.MONGO_PORT }}
+          MONGO_USERNAME: ${{ vars.MONGO_USERNAME }}
+          MONGO_DATABASE: ${{ vars.MONGO_DATABASE || 'picpac' }}
+          MONGO_AUTH_SOURCE: ${{ vars.MONGO_AUTH_SOURCE }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMS_ACCESS_KEY_ID: ${{ secrets.SMS_ACCESS_KEY_ID }}
+          SMS_ACCESS_KEY_SECRET: ${{ secrets.SMS_ACCESS_KEY_SECRET }}
+          SMS_SECURITY_TOKEN: ${{ secrets.SMS_SECURITY_TOKEN }}
+          SMS_SCHEME_NAME: ${{ vars.SMS_SCHEME_NAME }}
+          SMS_SIGN_NAME: ${{ vars.SMS_SIGN_NAME }}
+          SMS_TEMPLATE_CODE: ${{ vars.SMS_TEMPLATE_CODE }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
           SSH_PORT: ${{ vars.SSH_PORT || '22' }}
-          CONFIG_PATH: ${{ vars.K3S_CONFIG_PATH || '/etc/picpac/config.json' }}
+          CONFIG_PATH: ${{ vars.K3S_CONFIG_PATH || '/picpac/config/config.json' }}
           NODE_PORT: ${{ vars.K3S_NODE_PORT || '32090' }}
-          MONGO_NODE_PORT: ${{ vars.MONGO_NODE_PORT || '32017' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -133,38 +170,11 @@ jobs:
           auth = base64.b64encode((os.environ['TCR_USERNAME'] + ':' + os.environ['TCR_PASSWORD']).encode()).decode()
           Path(os.environ['CREDENTIAL_FILE']).write_text(json.dumps({'auths': {os.environ['REGISTRY']: {'auth': auth}}}))
           PY
-          export CONFIG_OUTPUT="$ssh_dir/config.json"
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          from urllib.parse import urlsplit, unquote
-          config = json.loads(Path('config.json').read_text(encoding='utf-8-sig'))
-          overrides = json.loads(os.environ.get('PICPAC_CONFIG_OVERRIDES') or '{}')
-          if not isinstance(overrides, dict):
-              raise SystemExit('PICPAC_CONFIG_OVERRIDES must be a JSON object.')
-          def merge(target, values):
-              for key, value in values.items():
-                  if isinstance(value, dict):
-                      if not isinstance(target.get(key), dict):
-                          target[key] = {}
-                      merge(target[key], value)
-                  else:
-                      target[key] = value
-                      if isinstance(value, str) and value:
-                          mask = value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-                          print('::add-mask::' + mask)
-                          if key == 'uri' and value.startswith(('mongodb://', 'mongodb+srv://')):
-                              parsed = urlsplit(value)
-                              for credential in [parsed.username, parsed.password]:
-                                  if credential:
-                                      print('::add-mask::' + unquote(credential).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
-          merge(config, overrides)
-          Path(os.environ['CONFIG_OUTPUT']).write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
-          PY
+          python3 deploy/render-config.py config.prod.json "$ssh_dir/config.json"
           chmod 600 "$ssh_dir/tcr.json"
           chmod 600 "$ssh_dir/config.json"
           scp "${ssh_options[@]}" -P "$SSH_PORT" deploy/deploy-k3s.sh deploy/prepare-config.py deploy/picpac.yaml "$ssh_dir/tcr.json" "$ssh_dir/config.json" "$target:$remote_dir/"
-          printf -v command 'sudo -n -i bash %q %q %q %q %q %q %q %q %q' \
-            "$remote_dir/deploy-k3s.sh" "$IMAGE" "$CONFIG_PATH" "$PLATFORM" "$NODE_PORT" "$remote_dir/tcr.json" "$remote_dir/picpac.yaml" "$remote_dir/config.json" "$MONGO_NODE_PORT"
+          printf -v command 'sudo -n -i bash %q %q %q %q %q %q %q %q' \
+            "$remote_dir/deploy-k3s.sh" "$IMAGE" "$CONFIG_PATH" "$PLATFORM" "$NODE_PORT" "$remote_dir/tcr.json" "$remote_dir/picpac.yaml" "$remote_dir/config.json"
           ssh "${ssh_options[@]}" -p "$SSH_PORT" "$target" "$command"
           printf 'Deployed `%s` to k3s namespace `picpac`. NodePort: `%s`.\n' "$IMAGE" "$NODE_PORT" >> "$GITHUB_STEP_SUMMARY"

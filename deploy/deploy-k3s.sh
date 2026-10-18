@@ -9,7 +9,6 @@ node_port="${4:?NodePort is required}"
 credentials_file="${5:?registry credentials file is required}"
 template_file="${6:?deployment template is required}"
 incoming_config="${7:-}"
-mongo_node_port="${8:-32017}"
 k3s_bin="${K3S_BIN:-/usr/local/bin/k3s}"
 python_bin="${PYTHON_BIN:-python3}"
 
@@ -31,14 +30,14 @@ kube() { "$k3s_bin" kubectl "$@"; }
 work_dir="$(mktemp -d /tmp/picpac-k3s.XXXXXX)"
 trap 'rm -rf -- "$work_dir"' EXIT
 runtime_config="$work_dir/config.json"
-port="$("$python_bin" "$(dirname "$template_file")/prepare-config.py" "$config_source" "$runtime_config" "$config_file" "$k3s_bin" "$mongo_node_port")"
+port="$("$python_bin" "$(dirname "$template_file")/prepare-config.py" "$config_source" "$runtime_config" "$config_file")"
 if [[ -n "$incoming_config" ]]; then
   [[ "$config_file" == /* ]] || { echo 'Config destination must be an absolute server path.' >&2; exit 1; }
   mkdir -p -- "$(dirname "$config_file")"
   staged_config="$(mktemp "${config_file}.XXXXXX")"
   install -m 600 "$runtime_config" "$staged_config"
   mv -f -- "$staged_config" "$config_file"
-  echo 'Synchronized repository config and runtime overrides to the server.'
+  echo 'Synchronized production config and individual Secrets to the server.'
 fi
 config_sha="$(sha256sum "$runtime_config" | cut -d ' ' -f1)"
 

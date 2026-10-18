@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,12 +42,6 @@ printf '%s ' "$@" >> "$FAKE_CALLS"
 printf '\\n' >> "$FAKE_CALLS"
 args="$*"
 case "$args" in
-  *'get services -A -o json'*)
-    if [[ "${FAKE_MONGO_SERVICE:-0}" == 1 ]]; then
-      echo '{"items":[{"metadata":{"name":"mongodb","namespace":"data"},"spec":{"selector":{"app":"mongodb"},"ports":[{"port":27017,"nodePort":32017}]}}]}'
-    else echo '{"items":[]}'; fi ;;
-  *'get pods -l '*)
-    echo '{"items":[{"spec":{"containers":[{"env":[{"name":"MONGO_INITDB_ROOT_USERNAME","value":"example-user"},{"name":"MONGO_INITDB_ROOT_PASSWORD","value":"test-only-password"}]}]}}]}' ;;
   *'get deployment picpac --ignore-not-found'*)
     if [[ "${FAKE_EXISTING:-0}" == 1 ]]; then echo deployment.apps/picpac; fi ;;
   *'get service picpac --ignore-not-found'*)
@@ -88,7 +83,7 @@ esac
             self.credentials.as_posix(), (ROOT / "deploy/picpac.yaml").as_posix(),
         ]
         if incoming:
-            args.extend([incoming, "32017"])
+            args.append(incoming)
         return subprocess.run(args, env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     def test_first_deployment_creates_workload_and_service(self):
@@ -128,7 +123,7 @@ esac
                 result = self.run_deploy()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("loopback", result.stderr)
-                self.assertNotIn("apply", self.calls.read_text())
+                self.assertFalse(self.calls.exists())
 
     def test_invalid_image_and_nodeport_are_rejected(self):
         for image, port in [(IMAGE + ";whoami", "32090"), (IMAGE, "22")]:
@@ -172,11 +167,15 @@ esac
         self.assertEqual(config["server"], {"port": "9090"})
         self.assertGreater(len(config["auth"]["access_token_secret"]), 40)
 
-    def test_loopback_mongo_resolves_only_the_selected_service(self):
-        self.env["FAKE_MONGO_SERVICE"] = "1"
+    def test_split_mongo_uses_internal_service_and_encodes_credentials(self):
+        password = 'test-only-password@:/"\\\n\u4e2d'
         self.config.write_text(json.dumps({
             "server": {"port": "9090"},
-            "mongo": {"uri": "mongodb://localhost:32017/picpac?replicaSet=rs0"},
+            "mongo": {
+                "service": "mongodb.data.svc.cluster.local", "port": "27017",
+                "username": "example-user", "password": password, "database": "picpac",
+                "options": {"authSource": "admin", "replicaSet": "rs0"},
+            },
         }))
         destination = self.work / "server-config.json"
         shell_path = destination.as_posix()
@@ -185,7 +184,62 @@ esac
         result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         config = json.loads(destination.read_text())
-        self.assertEqual(config["mongo"]["uri"], "mongodb://example-user:test-only-password@mongodb.data.svc.cluster.local:27017/picpac?replicaSet=rs0")
+        parsed = urlsplit(config["mongo"]["uri"])
+        self.assertEqual(parsed.hostname, "mongodb.data.svc.cluster.local")
+        self.assertEqual(parsed.port, 27017)
+        self.assertEqual(unquote(parsed.password), password)
+        self.assertEqual(parse_qs(parsed.query), {"authSource": ["admin"], "replicaSet": ["rs0"]})
+        self.assertNotIn("password", config["mongo"])
+        self.assertNotIn("get services", self.calls.read_text())
+        self.assertNotIn(password, result.stdout + result.stderr)
+
+    def test_split_mongo_reuses_saved_credentials_on_upgrade(self):
+        self.config.write_text(json.dumps({
+            "server": {"port": "9090"},
+            "mongo": {"service": "", "port": "", "username": "", "password": "", "database": "picpac", "options": {"authSource": ""}},
+        }))
+        destination = self.work / "server-config.json"
+        destination.write_text(json.dumps({"mongo": {"uri": "mongodb://example-user:test-only-password@mongodb.data.svc.cluster.local:27018/picpac?replicaSet=rs0&authSource=users"}}))
+        shell_path = destination.as_posix()
+        if os.name == "nt":
+            shell_path = "/" + shell_path[0].lower() + shell_path[2:]
+        result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        uri = json.loads(destination.read_text())["mongo"]["uri"]
+        self.assertIn("example-user:test-only-password@mongodb.data.svc.cluster.local:27018", uri)
+        self.assertEqual(parse_qs(urlsplit(uri).query), {"replicaSet": ["rs0"], "authSource": ["users"]})
+
+    def test_split_mongo_missing_first_deploy_settings_fails_before_changes(self):
+        for updates, message in [
+            ({"service": ""}, "MONGO_SERVICE"),
+            ({"password": ""}, "MONGO_PASSWORD"),
+            ({"username": ""}, "MONGO_USERNAME"),
+            ({"port": "99999"}, "MONGO_PORT"),
+            ({"service": "localhost"}, "loopback"),
+        ]:
+            with self.subTest(updates=updates):
+                mongo = {"service": "mongodb.data.svc.cluster.local", "port": "27017", "username": "example-user", "password": "test-only-password", "database": "picpac"}
+                mongo.update(updates)
+                self.config.write_text(json.dumps({"server": {"port": "9090"}, "mongo": mongo}))
+                result = self.run_deploy(incoming=self.config.as_posix(), destination=(self.work / "nonexistent.json").as_posix())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("test-only-password", result.stderr)
+                self.assertFalse(self.calls.exists())
+
+    def test_split_mongo_does_not_reuse_password_for_a_different_server(self):
+        self.config.write_text(json.dumps({
+            "server": {"port": "9090"},
+            "mongo": {"service": "other.data.svc.cluster.local", "port": "27017", "username": "example-user", "password": "", "database": "picpac"},
+        }))
+        destination = self.work / "server-config.json"
+        saved = '{"mongo":{"uri":"mongodb://example-user:test-only-password@mongodb.data.svc.cluster.local:27017/picpac"}}'
+        destination.write_text(saved)
+        result = self.run_deploy(incoming=self.config.as_posix(), destination=destination.as_posix())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MONGO_PASSWORD", result.stderr)
+        self.assertEqual(destination.read_text(), saved)
+        self.assertFalse(self.calls.exists())
 
     def test_jwt_is_generated_on_server_and_preserved(self):
         placeholder = "\u5077apikey\u7684\u66ff\u6211\u6321\u707e"

@@ -16,7 +16,7 @@ on:
         type: boolean
         default: true
       platform:
-        description: Match the TKE worker node architecture
+        description: Match the k3s node architecture
         type: choice
         options:
           - linux/amd64
@@ -138,7 +138,7 @@ jobs:
           grep -qx 'app/picpac' "$RUNNER_TEMP/picpac-rootfs.txt"
           grep -qx 'app/category.json' "$RUNNER_TEMP/picpac-rootfs.txt"
           grep -qx 'etc/ssl/certs/ca-certificates.crt' "$RUNNER_TEMP/picpac-rootfs.txt"
-          if grep -Eq '(^|/)(config\.json|\.git)(/|$)' "$RUNNER_TEMP/picpac-rootfs.txt"; then
+          if grep -Eq '(^|/)(config(\.prod)?\.json|\.git)(/|$)' "$RUNNER_TEMP/picpac-rootfs.txt"; then
             echo "::error::Runtime configuration or Git metadata was included in the image"
             exit 1
           fi
