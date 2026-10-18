@@ -1,6 +1,9 @@
 name: Container image
 
 on:
+  pull_request:
+    types: [closed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       platform:
@@ -14,16 +17,16 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: container-image-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
   # Disable Docker's build-record artifact upload to avoid storage charges.
   DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
   image:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    # Configure required reviewers on this environment in repository settings.
+    # Keep each merge's approval independent; do not group waiting runs together.
+    environment: release-approval
     runs-on: ubuntu-latest
     # Allow slow TCR uploads up to GitHub's hosted-job limit.
     timeout-minutes: 360
@@ -34,6 +37,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up Go
