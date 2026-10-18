@@ -8,21 +8,12 @@ import sys
 
 
 PLACEHOLDER = "\u5077apikey\u7684\u66ff\u6211\u6321\u707e"
-SECRET_FIELDS = {
-    "MONGO_PASSWORD": ("mongo", "password"),
-    "JWT_SECRET": ("auth", "access_token_secret"),
-    "OSS_ACCESS_KEY_ID": ("oss", "access_key_id"),
-    "OSS_ACCESS_KEY_SECRET": ("oss", "access_key_secret"),
-    "DASHSCOPE_API_KEY": ("dashscope", "api_key"),
-    "DEEPSEEK_API_KEY": ("deepseek", "api_key"),
-    "SMS_ACCESS_KEY_ID": ("auth", "phone_code", "access_key_id"),
-    "SMS_ACCESS_KEY_SECRET": ("auth", "phone_code", "access_key_secret"),
-    "SMS_SECURITY_TOKEN": ("auth", "phone_code", "security_token"),
+SECRET_NAMES = {
+    "MONGO_PASSWORD", "JWT_SECRET", "OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET",
+    "DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "SMS_ACCESS_KEY_ID",
+    "SMS_ACCESS_KEY_SECRET", "SMS_SECURITY_TOKEN",
 }
-VARIABLE_NAMES = {
-    "MONGO_SERVICE", "MONGO_PORT", "MONGO_USERNAME", "MONGO_DATABASE",
-    "MONGO_AUTH_SOURCE", "SMS_SCHEME_NAME", "SMS_SIGN_NAME", "SMS_TEMPLATE_CODE",
-}
+VARIABLE_NAMES = {"MONGO_AUTH_SOURCE"}
 
 
 def render(source, output, environ):
@@ -36,20 +27,18 @@ def render(source, output, environ):
             return {key: resolve(item) for key, item in value.items()}
         if isinstance(value, list):
             return [resolve(item) for item in value]
-        if isinstance(value, str) and re.fullmatch(r"\$\{[A-Z_]+\}", value):
+        if isinstance(value, str) and "${" in value:
+            if not re.fullmatch(r"\$\{[A-Z_]+\}", value):
+                raise ValueError("Production placeholders must occupy a whole JSON value.")
             name = value[2:-1]
+            if name in SECRET_NAMES:
+                return environ.get(name) or ("" if name == "SMS_SECURITY_TOKEN" else PLACEHOLDER)
             if name not in VARIABLE_NAMES:
                 raise ValueError("Unsupported production variable name.")
             return environ.get(name, "")
         return value
 
     config = resolve(config)
-    for name, keys in SECRET_FIELDS.items():
-        target = config
-        for key in keys[:-1]:
-            target = target[key]
-        # Empty Secrets preserve the explicit placeholder, except optional STS.
-        target[keys[-1]] = environ.get(name) or ("" if name == "SMS_SECURITY_TOKEN" else PLACEHOLDER)
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

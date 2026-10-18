@@ -74,7 +74,6 @@ jobs:
         run: python3 -m unittest discover -s deploy/tests -v
       - name: Validate production template
         env:
-          MONGO_DATABASE: picpac
           MONGO_AUTH_SOURCE: admin
           # Public test value; this step never connects to Mongo.
           MONGO_PASSWORD: ${{ github.sha }}
@@ -99,10 +98,6 @@ jobs:
           TCR_IMAGE: ${{ vars.TCR_IMAGE }}
           TCR_USERNAME: ${{ secrets.TCR_USERNAME }}
           TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
-          MONGO_SERVICE: ${{ vars.MONGO_SERVICE }}
-          MONGO_PORT: ${{ vars.MONGO_PORT }}
-          MONGO_USERNAME: ${{ vars.MONGO_USERNAME }}
-          MONGO_DATABASE: ${{ vars.MONGO_DATABASE || 'picpac' }}
           MONGO_AUTH_SOURCE: ${{ vars.MONGO_AUTH_SOURCE }}
           MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -113,9 +108,6 @@ jobs:
           SMS_ACCESS_KEY_ID: ${{ secrets.SMS_ACCESS_KEY_ID }}
           SMS_ACCESS_KEY_SECRET: ${{ secrets.SMS_ACCESS_KEY_SECRET }}
           SMS_SECURITY_TOKEN: ${{ secrets.SMS_SECURITY_TOKEN }}
-          SMS_SCHEME_NAME: ${{ vars.SMS_SCHEME_NAME }}
-          SMS_SIGN_NAME: ${{ vars.SMS_SIGN_NAME }}
-          SMS_TEMPLATE_CODE: ${{ vars.SMS_TEMPLATE_CODE }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
