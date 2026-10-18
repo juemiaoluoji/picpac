@@ -50,12 +50,6 @@ on:
         type: choice
         options: [linux/amd64, linux/arm64]
         default: linux/amd64
-  pull_request:
-    branches: [main]
-    paths:
-      - deploy/**
-      - .github/workflows/**
-      - config.prod.json
 
 permissions:
   contents: read
@@ -81,7 +75,6 @@ jobs:
 
   deploy:
     needs: validate
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
