@@ -27,6 +27,8 @@ VARIABLE_NAMES = {
 
 def render(source, output, environ):
     """Resolve whole-value placeholders without shell or raw JSON substitution."""
+    if not environ.get("MONGO_PASSWORD") or environ["MONGO_PASSWORD"] == PLACEHOLDER:
+        raise ValueError("MONGO_PASSWORD is required on every deployment.")
     config = json.loads(Path(source).read_text(encoding="utf-8-sig"))
 
     def resolve(value):
@@ -59,4 +61,4 @@ if __name__ == "__main__":
     try:
         render(sys.argv[1], sys.argv[2], os.environ)
     except (OSError, ValueError, KeyError, TypeError):
-        sys.exit("Could not render config.prod.json. Check its structure and variable names.")
+        sys.exit("Could not render config.prod.json. Check MONGO_PASSWORD, template structure and variable names.")

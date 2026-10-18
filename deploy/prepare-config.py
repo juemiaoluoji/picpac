@@ -13,7 +13,7 @@ PLACEHOLDER = "\u5077apikey\u7684\u66ff\u6211\u6321\u707e"
 
 
 def mongo_uri(mongo, previous):
-    """Build the application URI from split settings; reuse saved values on upgrade."""
+    """Build the URI with an explicit password; reuse saved nonsecret settings."""
     if "service" not in mongo:
         # Keep direct server-side configuration usable for manual deployments.
         uri = mongo.get("uri")
@@ -35,8 +35,8 @@ def mongo_uri(mongo, previous):
     same_endpoint = old_valid and host == saved.hostname and port == str(old_port or 27017)
     username = mongo.pop("username", "") or (unquote(saved.username or "") if same_endpoint else "")
     password = mongo.pop("password", "")
-    if not password or password == PLACEHOLDER:
-        password = unquote(saved.password or "") if same_endpoint and username == unquote(saved.username or "") else ""
+    if not isinstance(password, str) or not password or password == PLACEHOLDER:
+        sys.exit("MONGO_PASSWORD is required on every deployment.")
     database = mongo.get("database")
     if not isinstance(host, str) or not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?", host):
         sys.exit("Set MONGO_SERVICE to the Mongo Service DNS name.")
@@ -44,8 +44,8 @@ def mongo_uri(mongo, previous):
         sys.exit("MONGO_SERVICE must not be a loopback address.")
     if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
         sys.exit("MONGO_PORT must be an internal Service port between 1 and 65535.")
-    if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
-        sys.exit("Set MONGO_USERNAME and the MONGO_PASSWORD Secret for first deployment.")
+    if not isinstance(username, str) or not username:
+        sys.exit("Set MONGO_USERNAME for first deployment.")
     if not isinstance(database, str) or not database:
         sys.exit("MONGO_DATABASE is required.")
     # Preserve existing replica-set / TLS options when updating the same endpoint.

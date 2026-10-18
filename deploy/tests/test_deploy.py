@@ -193,10 +193,10 @@ esac
         self.assertNotIn("get services", self.calls.read_text())
         self.assertNotIn(password, result.stdout + result.stderr)
 
-    def test_split_mongo_reuses_saved_credentials_on_upgrade(self):
+    def test_split_mongo_reuses_nonsecret_settings_with_explicit_password(self):
         self.config.write_text(json.dumps({
             "server": {"port": "9090"},
-            "mongo": {"service": "", "port": "", "username": "", "password": "", "database": "picpac", "options": {"authSource": ""}},
+            "mongo": {"service": "", "port": "", "username": "", "password": "replacement-test-password", "database": "picpac", "options": {"authSource": ""}},
         }))
         destination = self.work / "server-config.json"
         destination.write_text(json.dumps({"mongo": {"uri": "mongodb://example-user:test-only-password@mongodb.data.svc.cluster.local:27018/picpac?replicaSet=rs0&authSource=users"}}))
@@ -206,7 +206,7 @@ esac
         result = self.run_deploy(incoming=self.config.as_posix(), destination=shell_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         uri = json.loads(destination.read_text())["mongo"]["uri"]
-        self.assertIn("example-user:test-only-password@mongodb.data.svc.cluster.local:27018", uri)
+        self.assertIn("example-user:replacement-test-password@mongodb.data.svc.cluster.local:27018", uri)
         self.assertEqual(parse_qs(urlsplit(uri).query), {"replicaSet": ["rs0"], "authSource": ["users"]})
 
     def test_split_mongo_missing_first_deploy_settings_fails_before_changes(self):
@@ -227,19 +227,21 @@ esac
                 self.assertNotIn("test-only-password", result.stderr)
                 self.assertFalse(self.calls.exists())
 
-    def test_split_mongo_does_not_reuse_password_for_a_different_server(self):
-        self.config.write_text(json.dumps({
-            "server": {"port": "9090"},
-            "mongo": {"service": "other.data.svc.cluster.local", "port": "27017", "username": "example-user", "password": "", "database": "picpac"},
-        }))
+    def test_split_mongo_never_reuses_the_saved_password(self):
         destination = self.work / "server-config.json"
         saved = '{"mongo":{"uri":"mongodb://example-user:test-only-password@mongodb.data.svc.cluster.local:27017/picpac"}}'
         destination.write_text(saved)
-        result = self.run_deploy(incoming=self.config.as_posix(), destination=destination.as_posix())
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("MONGO_PASSWORD", result.stderr)
-        self.assertEqual(destination.read_text(), saved)
-        self.assertFalse(self.calls.exists())
+        for host in ["mongodb.data.svc.cluster.local", "other.data.svc.cluster.local"]:
+            with self.subTest(host=host):
+                self.config.write_text(json.dumps({
+                    "server": {"port": "9090"},
+                    "mongo": {"service": host, "port": "27017", "username": "example-user", "password": "", "database": "picpac"},
+                }))
+                result = self.run_deploy(incoming=self.config.as_posix(), destination=destination.as_posix())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("MONGO_PASSWORD", result.stderr)
+                self.assertEqual(destination.read_text(), saved)
+                self.assertFalse(self.calls.exists())
 
     def test_jwt_is_generated_on_server_and_preserved(self):
         placeholder = "\u5077apikey\u7684\u66ff\u6211\u6321\u707e"

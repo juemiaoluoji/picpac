@@ -23,7 +23,7 @@ on:
       TCR_PASSWORD:
         required: true
       MONGO_PASSWORD:
-        required: false
+        required: true
       JWT_SECRET:
         required: false
       OSS_ACCESS_KEY_ID:
@@ -76,6 +76,8 @@ jobs:
         env:
           MONGO_DATABASE: picpac
           MONGO_AUTH_SOURCE: admin
+          # Public test value; this step never connects to Mongo.
+          MONGO_PASSWORD: ${{ github.sha }}
         run: python3 deploy/render-config.py config.prod.json "$RUNNER_TEMP/config.json"
 
   deploy:
@@ -124,7 +126,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for value in SSH_HOST SSH_USER SSH_PRIVATE_KEY SSH_KNOWN_HOSTS TCR_IMAGE TCR_USERNAME TCR_PASSWORD; do
+          for value in SSH_HOST SSH_USER SSH_PRIVATE_KEY SSH_KNOWN_HOSTS TCR_IMAGE TCR_USERNAME TCR_PASSWORD MONGO_PASSWORD; do
             if [[ -z "${!value}" ]]; then
               echo "::error::Missing repository configuration: $value"
               exit 1

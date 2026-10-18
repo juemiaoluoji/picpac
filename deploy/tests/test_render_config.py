@@ -41,12 +41,21 @@ class RenderConfigTests(unittest.TestCase):
         self.assertEqual(config["auth"]["phone_code"]["sign_name"], "test-sign")
 
     def test_empty_optional_secrets_leave_placeholders_for_external_services(self):
-        config = self.render({})
+        config = self.render({"MONGO_PASSWORD": "test-only-password"})
         self.assertEqual(config["mongo"]["service"], "")
-        self.assertEqual(config["mongo"]["password"], RENDERER.PLACEHOLDER)
+        self.assertEqual(config["mongo"]["password"], "test-only-password")
         self.assertEqual(config["auth"]["access_token_secret"], RENDERER.PLACEHOLDER)
         self.assertEqual(config["oss"]["access_key_id"], RENDERER.PLACEHOLDER)
         self.assertEqual(config["auth"]["phone_code"]["security_token"], "")
+
+    def test_missing_or_placeholder_mongo_password_is_rejected_before_writing(self):
+        for values in [{}, {"MONGO_PASSWORD": ""}, {"MONGO_PASSWORD": RENDERER.PLACEHOLDER}]:
+            with self.subTest(values_present=bool(values)):
+                with tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / "config.json"
+                    with self.assertRaisesRegex(ValueError, "MONGO_PASSWORD"):
+                        RENDERER.render(ROOT / "config.prod.json", output, values)
+                    self.assertFalse(output.exists())
 
     def test_actual_template_renders_to_application_runtime_config(self):
         with tempfile.TemporaryDirectory() as directory:
