@@ -39,20 +39,32 @@ OSS object key 约定：
 
 ## Formal APIs
 
+认证接口失败响应沿用 `{"error":"<message>"}` 格式，前端优先按 HTTP 状态码处理。
+验证码接口的公共错误如下，响应不会包含阿里云内部错误信息：
+
+| HTTP | `error` | 含义 |
+|---|---|---|
+| `400` | `invalid input` | JSON 格式错误 |
+| `400` | `phone is required` | 缺少手机号 |
+| `400` | `phone is invalid` | 手机号格式错误 |
+| `400` | `code is required` | 缺少验证码，仅登录接口 |
+| `400` | `phone code is invalid` | 验证码格式错误、错误或失效，仅登录接口 |
+| `429` | `phone code send too frequently` | 发送过于频繁，仅发送接口 |
+| `502` | `phone verification service is unavailable` | 验证码供应商暂时不可用 |
+
 ### Send Phone Code
 
 `POST /api/v1/auth/phone/code`
 
 用途：
-- 发送手机号登录验证码
-- 当前开发配置可使用固定验证码，生产环境必须接真实短信服务
-- 同一手机号会受到重发间隔和每日发送次数限制
+- 发送手机号验证码，可用于登录及已登录用户重置密码
+- `prod` 调用阿里云号码认证；`dev` 直接成功且不发送短信
 
 请求类型：
 - `application/json`
 
 请求字段：
-- `phone`: string，必填。中国大陆11位手机号会标准化为 `+86` 格式；也支持传入带 `+` 的国际号码
+- `phone`: string，必填。仅支持中国大陆 11 位手机号或带 `+86` 前缀的同一号码，后端统一存为 `+86` 格式
 
 请求示例：
 
@@ -70,10 +82,10 @@ OSS object key 约定：
 }
 ```
 
+`sent: true` 表示阿里云已接受发送请求，不代表运营商已确认短信送达。
+
 失败响应：
-- `400`: 缺少 `phone`，或手机号格式非法
-- `429`: 验证码发送过于频繁
-- `500`: 创建验证码或发送验证码失败
+- 见上方公共错误表；本接口可能返回 `400`、`429`、`502`
 
 ### Phone Code Login
 
@@ -81,7 +93,9 @@ OSS object key 约定：
 
 用途：
 - 使用手机号和验证码登录
+- `dev` 使用 `auth.phone_code.dev_fixed_code`（默认 `123456`）；`prod` 使用短信中的验证码
 - 首次手机号登录会自动创建 `User` 和 `AuthIdentity(provider=phone)`
+- 新用户默认用户名为 `picpacker_` 加手机号后四位，例如 `13800138000` → `picpacker_8000`；不保证唯一，已有用户名不会自动改写
 - 已存在手机号会复用原 User
 - 旧路径 `POST /api/v1/auth/phone/login` 暂时保留兼容，语义与本接口一致
 
@@ -89,8 +103,8 @@ OSS object key 约定：
 - `application/json`
 
 请求字段：
-- `phone`: string，必填
-- `code`: string，必填
+- `phone`: string，必填。仅支持中国大陆 11 位手机号或带 `+86` 前缀的同一号码
+- `code`: string，必填。6 位 ASCII 数字；dev 使用 `auth.phone_code.dev_fixed_code`，prod 使用实际短信中的验证码
 
 请求示例：
 
@@ -110,7 +124,7 @@ OSS object key 约定：
   "user": {
     "id": "6821c0c1f1b2f4d5a6b7c8d1",
     "profile": {
-      "username": "user8613800138000",
+      "username": "picpacker_8000",
       "gender": "",
       "birthday": "",
       "avatar_url": "https://picpac.oss-cn-shanghai.aliyuncs.com/users/default/avatar.png?Expires=1783588103&OSSAccessKeyId=...&Signature=...",
@@ -122,7 +136,7 @@ OSS object key 约定：
 ```
 
 失败响应：
-- `400`: 缺少 `phone`、缺少 `code`、手机号格式非法、验证码非法或超过尝试次数
+- 验证码相关错误见上方公共错误表；本接口可能返回 `400`、`502`
 - `404`: 已绑定身份对应的 User 不存在
 - `409`: 创建登录身份发生冲突且无法恢复
 - `500`: 创建 User、AuthIdentity、token 或生成头像访问 URL 失败
@@ -165,7 +179,7 @@ OSS object key 约定：
   "user": {
     "id": "6821c0c1f1b2f4d5a6b7c8d1",
     "profile": {
-      "username": "user8613800138000",
+      "username": "picpacker_8000",
       "gender": "",
       "birthday": "",
       "avatar_url": "https://picpac.oss-cn-shanghai.aliyuncs.com/users/default/avatar.png?Expires=1783588103&OSSAccessKeyId=...&Signature=...",
@@ -238,6 +252,40 @@ OSS object key 约定：
 - `400`: 缺少 `refresh_token`
 - `401`: refresh token 非法
 - `500`: revoke refresh token 失败
+
+### Auth Security
+
+`GET /api/v1/auth/security`
+
+用途：
+- 查询当前登录用户的账号安全状态
+- 前端账号安全页可用该接口展示手机号和登录密码是否已设置
+- 该接口只返回展示所需状态，不返回 password hash、失败次数、锁定时间等内部安全字段
+
+请求头：
+- `Authorization: Bearer <access_token>`
+
+请求体：
+- 无
+
+成功响应：
+
+```json
+{
+  "phone": "138****8000",
+  "password_setup": true
+}
+```
+
+响应字段：
+- `phone`: string，当前用户手机号的脱敏展示值；如果当前用户没有绑定手机号，则返回空字符串
+- `password_setup`: boolean，当前用户是否已经设置登录密码
+
+失败响应：
+- `401`: 缺少 access token，access token 非法或已过期
+- `403`: 用户已禁用
+- `404`: User 不存在
+- `500`: 查询 AuthIdentity 或 password credential 失败
 
 ### Setup Password
 
@@ -390,7 +438,7 @@ OSS object key 约定：
 {
   "id": "6821c0c1f1b2f4d5a6b7c8d1",
   "profile": {
-    "username": "user8613800138000",
+    "username": "picpacker_8000",
     "gender": "",
     "birthday": "",
     "avatar_url": "https://picpac.oss-cn-shanghai.aliyuncs.com/users/default/avatar.png?Expires=1783588103&OSSAccessKeyId=...&Signature=...",
@@ -405,9 +453,12 @@ OSS object key 约定：
 - `404`: User 不存在
 - `500`: 查询 User 或生成头像访问 URL 失败
 
-### Update My Profile
+### Update My Profile (Legacy PUT)
 
 `PUT /api/v1/me/profile`
+
+为旧客户端保留。`username`、`gender` 仍必填；`birthday` 未传或传空都会清空生日。新版前端建议使用下方 PATCH。
+头像大小和像素数限制与 PATCH 相同，超限返回 `413`；未知字段、重复字段和损坏的 multipart 请求返回 `400`。
 
 用途：
 - 更新当前登录用户的 profile
@@ -454,6 +505,99 @@ OSS object key 约定：
 - `404`: User 不存在
 - `502`: 上传头像到 OSS 失败
 - `500`: 更新用户资料或生成头像访问 URL 失败
+
+### Patch My Profile
+
+`PATCH /api/v1/me/profile`
+
+更新当前登录用户实际提交的资料字段；请求头为 `Authorization: Bearer <access_token>`，请求类型为 `multipart/form-data`（由客户端库生成 boundary）。不接受用户 ID，由登录身份确定用户。
+
+| 字段 | 类型 | 未传 | 传入 |
+| --- | --- | --- | --- |
+| `username` | string | 保持原值 | 去首尾空格后 1–32 字符，空字符串非法 |
+| `gender` | string | 保持原值 | `male`、`female`、`private`，空字符串非法 |
+| `birthday` | string | 保持原值 | `YYYY-MM-DD`；空字符串清空生日 |
+| `avatar` | 图片文件 | 保留头像，不上传 OSS | 校验并上传新原图及展示图 |
+
+至少提交一个上述字段；空请求、未知字段、重复字段、多张头像、损坏的 multipart、以普通文本提交 avatar 均返回 `400`。所有输入校验通过后才上传头像。前端仅在用户重新选择头像时提交文件；相同图片再次提交仍会上传。
+
+头像限制由 `auth.profile_upload.max_bytes` 和 `auth.profile_upload.max_pixels` 配置，未配置或非正数采用默认值：5 MiB（5242880 bytes）及 2000 万像素。整个 multipart 请求最多为头像字节上限加 1 MiB。当前支持可解码的 JPEG、PNG、GIF；展示图为 JPEG。字节数和尺寸在完整解码前检查，超限返回 `413`。PUT 同样适用。
+
+示例：仅修改用户名。
+
+```bash
+curl -X PATCH 'http://localhost:9090/api/v1/me/profile' \
+  -H 'Authorization: Bearer <access_token>' \
+  -F 'username=新的用户名'
+```
+
+仅清空生日：`birthday=`；只更换头像：提交 `avatar` 文件，无需携带其他字段。
+
+成功返回 `200`，响应为与 PUT 相同的完整用户对象：`id`、`profile`（`username`、`gender`、`birthday`、`avatar_url`、`avatar_source_url`）、`status`。前端直接刷新本地资料，无需再查询；URL 为有时效的签名 URL。
+
+失败响应：
+- `400`：空请求、请求格式、字段值或图片非法。
+- `401`：未登录或 access token 无效。
+- `403`：用户已禁用。
+- `404`：用户不存在、已删除或写入时已不处于可更新状态。
+- `413`：请求、头像文件或图片像素数超过限制。
+- `502`：OSS 上传失败。
+- `500`：数据库更新或头像 URL 生成失败。
+
+存储采用字段级更新，不会用旧 User 文档覆盖其他字段；同一字段并发修改以后写入为准。头像路径保持不变，OSS 和 MongoDB 不存在跨系统事务：上传覆盖成功后数据库失败，或原图上传后展示图上传失败，已有云端对象可能已经变化。该版本不新增头像删除、默认头像恢复或旧对象清理。
+
+### Launch Screen
+
+`GET /api/v1/app/launch-screen`
+
+获取当前启动页配置。该接口不要求登录，App 启动时调用。后端从 MongoDB 读取当前配置，并为 OSS 媒体生成临时 signed URL；响应不会暴露 OSS object key。
+
+成功响应：
+
+```json
+{
+  "enabled": true,
+  "revision": "2026-10-08",
+  "type": "image",
+  "media_url": "https://picpac.oss-cn-shanghai.aliyuncs.com/app/launch-screen/v1/image.webp?Expires=...&Signature=...",
+  "poster_url": "",
+  "duration_ms": 2500,
+  "skip_enabled": true
+}
+```
+
+响应字段：
+
+- `enabled`: 是否显示启动页。
+- `revision`: 启动页配置修订号，格式为 `YYYY-MM-DD`；同一天第二次发布可使用 `YYYY-MM-DD-02`。客户端可以用它判断本地缓存是否需要更新。
+- `type`: `image` 或 `video`。
+- `media_url`: 图片或视频的临时 signed URL。
+- `poster_url`: 视频开始播放前显示的封面 URL；`image` 类型为空字符串。
+- `duration_ms`: 建议展示时长，单位毫秒。
+- `skip_enabled`: 是否允许用户跳过。
+
+视频响应的 `type` 为 `video`，`media_url` 指向视频，`poster_url` 指向视频封面。图片响应的 `media_url` 指向图片，`poster_url` 为空。
+
+没有启用配置时仍返回 `200`：
+
+```json
+{
+  "enabled": false,
+  "revision": "",
+  "type": "",
+  "media_url": "",
+  "poster_url": "",
+  "duration_ms": 0,
+  "skip_enabled": true
+}
+```
+
+前端在请求失败或 `enabled=false` 时使用内置默认图片。响应带有 `Cache-Control: no-cache`；媒体资源应使用与 `revision` 对齐的 OSS 路径，例如 `app/launch-screen/2026-10-08/image.webp`、`app/launch-screen/2026-10-08-02/video.mp4` 和 `app/launch-screen/2026-10-08-02/poster.webp`。第一版不支持 `starts_at`、`ends_at` 或公开配置修改接口，当前配置通过 `launch_screen_configs` 集合维护。MongoDB 文档使用 Repository 定义的 BSON 字段名：`ena`、`rev`、`typ`、`mk`、`pk`、`dur`、`skip`、`uat`。
+
+失败响应：
+
+- `500`: 查询启动页配置失败。
+- `500`: 生成 OSS signed URL 失败或配置内容非法。
 
 ### List Categories
 
@@ -1625,3 +1769,41 @@ OSS object key 约定：
 
 后续仍计划补充以下正式接口：
 - User authentication
+
+### Reset Password With Phone Code
+
+`POST /api/v1/auth/password/reset`
+
+需要 `Authorization: Bearer <access_token>`。用于已登录用户重置已设置的密码。
+
+请求 JSON：
+
+```json
+{
+    "phone": "13800138000",
+    "code": "123456",
+    "new_password": "NewPass2026!"
+}
+```
+
+- `phone`：必填，完整大陆 11 位手机号或 `+86` 格式，必须属于当前用户；不能提交脱敏号码。
+- `code`：必填，6 位 ASCII 数字。原样复用现有发送验证码接口，不新增用途参数。
+- `new_password`：必填，沿用现有密码强度规则，且必须与旧密码不同。
+- 用户身份来自 access token，不接受请求体指定用户身份。
+- dev 使用 `auth.phone_code.dev_fixed_code`（默认 `123456`），无需先发送；prod 使用现有阿里云短信核验。
+- 登录和重置共用验证码：有效登录验证码可以用于重置，反之亦然；重复发送沿用现有阿里云覆盖策略。
+- 不新增验证码预验证接口或 reset token。前端两页流程需保留手机号和验证码，到最终设置页面一次提交；验证码错误在最终提交时返回。
+- 不自动注册用户或首次创建密码凭证。未设置密码继续使用现有 setup 接口。
+
+成功响应：`{"reset":true}`。密码更新、清空登录失败次数/锁定状态及撤销已有 refresh token 在同一 MongoDB 事务内完成（需 replica set 或支持事务的集群）。不自动登录；前端清理本地登录信息并返回登录页。旧 access token 仍自然过期。
+
+失败响应：
+- `400`：请求形态、手机号、验证码或密码非法；验证码核验不通过；新旧密码相同。
+- `401`：未登录或 access token 无效。
+- `403`：用户禁用或手机号不属于当前用户。
+- `404`：用户不存在或尚未设置密码。
+- `409`：核验期间密码已被其他请求修改，需要重新开始重置。
+- `502`：阿里云核验不可用；不会回退使用固定码。
+- `500`：数据库或密码处理失败；事务失败时不保留部分修改。验证码可能已经核验，应允许用户重新获取验证码后重试。
+
+本接口不额外承诺短信验证码一次性消费，沿用阿里云核验生命周期；不会在 MongoDB 存储验证码。并发条件更新可阻止基于同一旧密码的覆盖，但不等同于验证码防重放。

@@ -1,0 +1,55 @@
+{
+  "env": "prod",
+  "server": { "port": "9090" },
+  "oss": {
+    "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
+    "bucket_name": "picpac",
+    "access_key_id": "${OSS_ACCESS_KEY_ID}",
+    "access_key_secret": "${OSS_ACCESS_KEY_SECRET}",
+    "public_base_url": "https://picpac.oss-cn-shanghai.aliyuncs.com",
+    "signed_url_ttl_seconds": 86400
+  },
+  "dashscope": {
+    "api_key": "${DASHSCOPE_API_KEY}",
+    "image_model": "qwen-image-2.0"
+  },
+  "deepseek": {
+    "api_key": "${DEEPSEEK_API_KEY}",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1/chat/completions"
+  },
+  "mongo": {
+    "service": "mongo.picpac.svc.cluster.local",
+    "port": "27017",
+    "username": "admin",
+    "password": "${MONGO_PASSWORD}",
+    "database": "picpac",
+    "options": { "authSource": "${MONGO_AUTH_SOURCE}" },
+    "connect_timeout_seconds": 10,
+    "max_pool_size": 20
+  },
+  "auth": {
+    "access_token_ttl_seconds": 7200,
+    "refresh_token_ttl_seconds": 2592000,
+    "phone_code": {
+      "access_key_id": "${SMS_ACCESS_KEY_ID}",
+      "access_key_secret": "${SMS_ACCESS_KEY_SECRET}",
+      "security_token": "${SMS_SECURITY_TOKEN}",
+      "scheme_name": "",
+      "sign_name": "恒创联众",
+      "template_code": "100001",
+      "request_timeout_seconds": 10,
+      "valid_time_seconds": 300,
+      "interval_seconds": 60,
+      "duplicate_policy": 1,
+      "dev_fixed_code": "123456"
+    }
+  },
+  "cors": {
+    "allowed_origins": [
+      "http://localhost:54771",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000"
+    ]
+  }
+}

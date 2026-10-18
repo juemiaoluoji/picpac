@@ -4,13 +4,13 @@ import "io"
 
 // SendPhoneCodeInput defines the input for sending a phone login code.
 type SendPhoneCodeInput struct {
-	Phone string `json:"phone"`
+	Phone string `json:"phone" binding:"required"`
 }
 
 // PhoneLoginInput defines the input for phone login.
 type PhoneLoginInput struct {
-	Phone string `json:"phone"`
-	Code  string `json:"code"`
+	Phone string `json:"phone" binding:"required"`
+	Code  string `json:"code" binding:"required,len=6,numeric"`
 }
 
 // PhonePasswordLoginInput defines the input for phone password login.
@@ -41,6 +41,13 @@ type ChangePasswordInput struct {
 	UserID      string `json:"-"`
 	OldPassword string `json:"old_password"`
 	NewPassword string `json:"new_password"`
+}
+
+// ResetPasswordInput defines the HTTP input for resetting a password with a phone code.
+type ResetPasswordInput struct {
+	Phone       string `json:"phone" binding:"required"`
+	Code        string `json:"code" binding:"required,len=6,numeric"`
+	NewPassword string `json:"new_password" binding:"required"`
 }
 
 // UpdateMyProfileInput defines the input for updating the current user profile.

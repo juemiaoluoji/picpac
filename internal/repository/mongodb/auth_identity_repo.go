@@ -53,6 +53,21 @@ func (r *AuthIdentityRepository) GetByProviderAndIdentifier(ctx context.Context,
 	return &identity, nil
 }
 
+// GetByUserIDAndProvider returns an active auth identity by user id and provider.
+func (r *AuthIdentityRepository) GetByUserIDAndProvider(ctx context.Context, userID bson.ObjectID, provider domain.AuthProvider) (*domain.AuthIdentity, error) {
+	var doc authIdentityDocument
+	if err := r.collection.FindOne(ctx, bson.M{
+		"uid": userID,
+		"prv": provider,
+		"st":  domain.AuthIdentityStatusActive,
+	}).Decode(&doc); err != nil {
+		return nil, err
+	}
+
+	identity := newDomainAuthIdentity(doc)
+	return &identity, nil
+}
+
 // DisableByUserID disables all active auth identities for a user.
 func (r *AuthIdentityRepository) DisableByUserID(ctx context.Context, userID bson.ObjectID, disabledAt time.Time) error {
 	_, err := r.collection.UpdateMany(ctx, bson.M{

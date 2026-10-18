@@ -27,11 +27,12 @@ type userPasswordCredentialDocument struct {
 // UserPasswordCredentialRepository stores user password credentials in MongoDB.
 type UserPasswordCredentialRepository struct {
 	collection *mongo.Collection
+	database   *mongo.Database
 }
 
 // NewUserPasswordCredentialRepository creates a MongoDB-backed password credential repository.
 func NewUserPasswordCredentialRepository(db *mongo.Database) *UserPasswordCredentialRepository {
-	return &UserPasswordCredentialRepository{collection: db.Collection(userPasswordCredentialCollectionName)}
+	return &UserPasswordCredentialRepository{collection: db.Collection(userPasswordCredentialCollectionName), database: db}
 }
 
 // Create inserts a user password credential document into MongoDB.
@@ -148,4 +149,28 @@ func newDomainUserPasswordCredential(doc userPasswordCredentialDocument) domain.
 		CreatedAt:          doc.CreatedAt,
 		UpdatedAt:          doc.UpdatedAt,
 	}
+}
+
+// UpdatePasswordAndRevokeTokens atomically replaces an unchanged password and revokes existing refresh tokens.
+func (r *UserPasswordCredentialRepository) UpdatePasswordAndRevokeTokens(ctx context.Context, userID bson.ObjectID, expectedHash, passwordHash, passwordAlgo string, updatedAt time.Time) error {
+	session, err := r.database.Client().StartSession()
+	if err != nil {
+		return err
+	}
+	defer session.EndSession(ctx)
+	_, err = session.WithTransaction(ctx, func(tx context.Context) (any, error) {
+		result, err := r.collection.UpdateOne(tx, bson.M{"uid": userID, "ph": expectedHash}, bson.M{
+			"$set":   bson.M{"ph": passwordHash, "pa": passwordAlgo, "fac": 0, "uat": updatedAt},
+			"$unset": bson.M{"lck": ""},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if result.MatchedCount == 0 {
+			return nil, mongo.ErrNoDocuments
+		}
+		err = NewRefreshTokenRepository(r.database).RevokeByUserID(tx, userID, updatedAt)
+		return nil, err
+	})
+	return err
 }

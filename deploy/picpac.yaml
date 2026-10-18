@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: picpac
+  namespace: picpac
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 180
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: picpac
+  template:
+    metadata:
+      labels:
+        app: picpac
+      annotations:
+        picpac/config-sha256: __CONFIG_SHA__
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: __ARCH__
+      imagePullSecrets:
+        - name: tcr-pull
+      containers:
+        - name: picpac
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: __PORT__
+          env:
+            - name: PICPAC_CONFIG
+              value: /app/config/config.json
+          volumeMounts:
+            - name: picpac-config
+              mountPath: /app/config/config.json
+              subPath: config.json
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /api/v1/categories
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 2
+      volumes:
+        - name: picpac-config
+          secret:
+            secretName: picpac-config
+            defaultMode: 0444

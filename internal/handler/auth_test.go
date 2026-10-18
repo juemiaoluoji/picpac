@@ -23,10 +23,13 @@ import (
 
 type fakeAuthService struct {
 	err                 error
+	sendPhoneCodeCalls  int
+	phoneLoginCalls     int
 	passwordLoginErr    error
 	setupPasswordErr    error
 	changePasswordErr   error
 	user                *domain.User
+	security            *domain.AuthSecurity
 	deletedUserID       string
 	passwordLoginInput  request.PhonePasswordLoginInput
 	setupPasswordInput  request.SetupPasswordInput
@@ -45,10 +48,12 @@ func (s fakeObjectURLSigner) SignGetURL(_ context.Context, objectKey string) (st
 }
 
 func (s *fakeAuthService) SendPhoneCode(_ context.Context, _ request.SendPhoneCodeInput) error {
+	s.sendPhoneCodeCalls++
 	return s.err
 }
 
 func (s *fakeAuthService) LoginWithPhone(_ context.Context, _ request.PhoneLoginInput) (*service.AuthResult, error) {
+	s.phoneLoginCalls++
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -88,6 +93,16 @@ func (s *fakeAuthService) ChangePassword(_ context.Context, input request.Change
 		return s.changePasswordErr
 	}
 	return nil
+}
+
+func (s *fakeAuthService) GetSecurity(_ context.Context, _ string) (*domain.AuthSecurity, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.security != nil {
+		return s.security, nil
+	}
+	return &domain.AuthSecurity{Phone: "138****8000", PasswordSetup: true}, nil
 }
 
 func (s *fakeAuthService) Me(_ context.Context, _ string) (*domain.User, error) {
@@ -155,6 +170,28 @@ func TestSendPhoneCodeHandlerReturnsSent(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"sent":true`) {
 		t.Fatalf("unexpected body: %s", recorder.Body.String())
+	}
+}
+
+func TestSendPhoneCodeHandlerRequiresPhone(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	authService := &fakeAuthService{}
+	authHandler := NewAuthHandler(authService, fakeObjectURLSigner{})
+	router.POST("/api/v1/auth/phone/code", authHandler.SendPhoneCode)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/phone/code", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest || recorder.Body.String() != `{"error":"phone is required"}` {
+		t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if authService.sendPhoneCodeCalls != 0 {
+		t.Fatal("invalid input reached auth service")
 	}
 }
 
@@ -417,7 +454,8 @@ func TestLoginWithPhoneHandlerRejectsMissingCode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	router := gin.New()
-	authHandler := NewAuthHandler(&fakeAuthService{}, fakeObjectURLSigner{})
+	authService := &fakeAuthService{}
+	authHandler := NewAuthHandler(authService, fakeObjectURLSigner{})
 	router.POST("/api/v1/auth/phone/login", authHandler.LoginWithPhone)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/phone/login", bytes.NewBufferString(`{"phone":"13800138000"}`))
@@ -427,15 +465,47 @@ func TestLoginWithPhoneHandlerRejectsMissingCode(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", recorder.Code)
 	}
+	if recorder.Body.String() != `{"error":"code is required"}` {
+		t.Fatalf("unexpected body: %s", recorder.Body.String())
+	}
+	if authService.phoneLoginCalls != 0 {
+		t.Fatal("invalid input reached auth service")
+	}
 }
 
-func TestAuthHandlerMapsTooFrequent(t *testing.T) {
+func TestLoginWithPhoneHandlerValidatesCodeShape(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []string{"12345", "1234567", "abcdef"} {
+		t.Run(code, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			router := gin.New()
+			authService := &fakeAuthService{}
+			authHandler := NewAuthHandler(authService, fakeObjectURLSigner{})
+			router.POST("/api/v1/auth/phone/code/login", authHandler.LoginWithPhone)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/phone/code/login", bytes.NewBufferString(`{"phone":"13800138000","code":"`+code+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusBadRequest || recorder.Body.String() != `{"error":"phone code is invalid"}` {
+				t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
+			}
+			if authService.phoneLoginCalls != 0 {
+				t.Fatal("invalid input reached auth service")
+			}
+		})
+	}
+}
+
+func TestAuthHandlerMapsProviderRateLimit(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	router := gin.New()
-	authHandler := NewAuthHandler(&fakeAuthService{err: errors.New("phone code send too frequently")}, fakeObjectURLSigner{})
+	authHandler := NewAuthHandler(&fakeAuthService{err: service.ErrPhoneCodeRateLimited}, fakeObjectURLSigner{})
 	router.POST("/api/v1/auth/phone/code", authHandler.SendPhoneCode)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/phone/code", bytes.NewBufferString(`{"phone":"13800138000"}`))
@@ -444,6 +514,42 @@ func TestAuthHandlerMapsTooFrequent(t *testing.T) {
 
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429, got %d", recorder.Code)
+	}
+	if recorder.Body.String() != `{"error":"phone code send too frequently"}` {
+		t.Fatalf("unexpected body: %s", recorder.Body.String())
+	}
+}
+
+func TestAuthHandlerMapsPhoneVerificationUnavailable(t *testing.T) {
+	t.Parallel()
+
+	for _, endpoint := range []string{"/api/v1/auth/phone/code", "/api/v1/auth/phone/code/login"} {
+		t.Run(endpoint, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			router := gin.New()
+			authHandler := NewAuthHandler(&fakeAuthService{err: service.ErrPhoneVerificationUnavailable}, fakeObjectURLSigner{})
+			if endpoint == "/api/v1/auth/phone/code" {
+				router.POST(endpoint, authHandler.SendPhoneCode)
+			} else {
+				router.POST(endpoint, authHandler.LoginWithPhone)
+			}
+
+			body := `{"phone":"13800138000"}`
+			if strings.HasSuffix(endpoint, "/login") {
+				body = `{"phone":"13800138000","code":"123456"}`
+			}
+			req := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("expected 502, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Body.String() != `{"error":"phone verification service is unavailable"}` {
+				t.Fatalf("unexpected body: %s", recorder.Body.String())
+			}
+		})
 	}
 }
 
@@ -472,6 +578,45 @@ func TestMeHandlerReturnsCurrentUser(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), userID.Hex()) {
 		t.Fatalf("unexpected body: %s", recorder.Body.String())
+	}
+}
+
+func TestGetSecurityHandlerReturnsCurrentSecurity(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	tokenService := service.NewTokenService("test-secret", time.Hour)
+	userID := bson.NewObjectID()
+	token, err := tokenService.CreateAccessToken(userID)
+	if err != nil {
+		t.Fatalf("CreateAccessToken returned error: %v", err)
+	}
+	authService := &fakeAuthService{
+		user:     &domain.User{ID: userID, Profile: domain.UserProfile{Username: "用户8000", AvatarObjectKey: "users/default/avatar.png"}, Status: domain.UserStatusCreated},
+		security: &domain.AuthSecurity{Phone: "138****8000", PasswordSetup: false},
+	}
+	authHandler := NewAuthHandler(authService, fakeObjectURLSigner{})
+	authMiddleware := NewAuthMiddleware(tokenService, authHandler.svc)
+	router.GET("/api/v1/auth/security", authMiddleware.RequireAuth(), authHandler.GetSecurity)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/security", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recorder.Code)
+	}
+	var resp struct {
+		Phone         string `json:"phone"`
+		PasswordSetup bool   `json:"password_setup"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Phone != "138****8000" || resp.PasswordSetup {
+		t.Fatalf("unexpected security response: %+v", resp)
 	}
 }
 
@@ -692,4 +837,14 @@ func TestAuthMiddlewareRejectsDeletedUser(t *testing.T) {
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", recorder.Code)
 	}
+}
+
+// ResetPassword implements password reset for HTTP tests.
+func (s *fakeAuthService) ResetPassword(_ context.Context, _ service.ResetPasswordInput) error {
+	return nil
+}
+
+// PatchMyProfile implements profile patching for HTTP tests.
+func (s *fakeAuthService) PatchMyProfile(_ context.Context, _ string, _ service.ProfilePatchInput) (*domain.User, error) {
+	return &domain.User{}, nil
 }

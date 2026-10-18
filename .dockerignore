@@ -1,0 +1,17 @@
+# Only application build inputs are sent to the Docker builder.
+**
+!Dockerfile
+!.dockerignore
+!go.mod
+!go.sum
+!category.json
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+
+# Runtime configuration and credentials never enter the build context.
+**/config.json
+**/.env*
+**/*.pem
+**/*.key

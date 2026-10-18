@@ -9,6 +9,7 @@ import (
 
 // Configuration defines the application runtime configuration loaded from config.json.
 type Configuration struct {
+	Env       string          `json:"env"`
 	Server    ServerConfig    `json:"server"`
 	OSS       OSSConfig       `json:"oss"`
 	Dashscope DashscopeConfig `json:"dashscope"`
@@ -72,21 +73,12 @@ type MongoConfig struct {
 
 // AuthConfig defines authentication settings.
 type AuthConfig struct {
-	AccessTokenSecret      string          `json:"access_token_secret"`
-	AccessTokenTTLSeconds  int             `json:"access_token_ttl_seconds"`
-	RefreshTokenTTLSeconds int             `json:"refresh_token_ttl_seconds"`
-	PhoneCode              PhoneCodeConfig `json:"phone_code"`
-	Password               PasswordConfig  `json:"password"`
-}
-
-// PhoneCodeConfig defines phone verification code settings.
-type PhoneCodeConfig struct {
-	TTLSeconds            int    `json:"ttl_seconds"`
-	MaxAttempts           int    `json:"max_attempts"`
-	ResendIntervalSeconds int    `json:"resend_interval_seconds"`
-	DailySendLimit        int    `json:"daily_send_limit"`
-	UseDevFixedCode       bool   `json:"use_dev_fixed_code"`
-	DevFixedCode          string `json:"dev_fixed_code"`
+	ProfileUpload          ProfileUploadConfig `json:"profile_upload"`
+	AccessTokenSecret      string              `json:"access_token_secret"`
+	AccessTokenTTLSeconds  int                 `json:"access_token_ttl_seconds"`
+	RefreshTokenTTLSeconds int                 `json:"refresh_token_ttl_seconds"`
+	PhoneCode              AliyunPNVSConfig    `json:"phone_code"`
+	Password               PasswordConfig      `json:"password"`
 }
 
 // PasswordConfig defines password credential settings.
@@ -134,6 +126,10 @@ func LoadCategorySeeds(path string) (*CategorySeedFile, error) {
 }
 
 func validate(cfg *Configuration) error {
+	cfg.Env = strings.TrimSpace(cfg.Env)
+	if cfg.Env != "dev" && cfg.Env != "prod" {
+		return fmt.Errorf("invalid config: env must be dev or prod")
+	}
 	switch {
 	case strings.TrimSpace(cfg.Server.Port) == "":
 		return fmt.Errorf("invalid config: server.port is required")
@@ -178,20 +174,27 @@ func validate(cfg *Configuration) error {
 	if cfg.Auth.RefreshTokenTTLSeconds <= 0 {
 		cfg.Auth.RefreshTokenTTLSeconds = 2592000
 	}
-	if cfg.Auth.PhoneCode.TTLSeconds <= 0 {
-		cfg.Auth.PhoneCode.TTLSeconds = 300
+	cfg.Auth.PhoneCode.DevFixedCode = strings.TrimSpace(cfg.Auth.PhoneCode.DevFixedCode)
+	if cfg.Auth.PhoneCode.DevFixedCode == "" {
+		cfg.Auth.PhoneCode.DevFixedCode = "123456"
 	}
-	if cfg.Auth.PhoneCode.MaxAttempts <= 0 {
-		cfg.Auth.PhoneCode.MaxAttempts = 5
+	if len(cfg.Auth.PhoneCode.DevFixedCode) != 6 || !asciiDigits(cfg.Auth.PhoneCode.DevFixedCode) {
+		return fmt.Errorf("invalid config: auth.phone_code.dev_fixed_code must contain six digits")
 	}
-	if cfg.Auth.PhoneCode.ResendIntervalSeconds <= 0 {
-		cfg.Auth.PhoneCode.ResendIntervalSeconds = 60
+	if cfg.Auth.PhoneCode.RequestTimeoutSeconds <= 0 {
+		cfg.Auth.PhoneCode.RequestTimeoutSeconds = 10
 	}
-	if cfg.Auth.PhoneCode.DailySendLimit <= 0 {
-		cfg.Auth.PhoneCode.DailySendLimit = 10
+	if cfg.Auth.PhoneCode.ValidTimeSeconds <= 0 {
+		cfg.Auth.PhoneCode.ValidTimeSeconds = 300
 	}
-	if cfg.Auth.PhoneCode.UseDevFixedCode && strings.TrimSpace(cfg.Auth.PhoneCode.DevFixedCode) == "" {
-		return fmt.Errorf("invalid config: auth.phone_code.dev_fixed_code is required when use_dev_fixed_code is true")
+	if cfg.Auth.PhoneCode.IntervalSeconds <= 0 {
+		cfg.Auth.PhoneCode.IntervalSeconds = 60
+	}
+	if cfg.Auth.PhoneCode.DuplicatePolicy == 0 {
+		cfg.Auth.PhoneCode.DuplicatePolicy = 1
+	}
+	if cfg.Auth.PhoneCode.DuplicatePolicy != 1 && cfg.Auth.PhoneCode.DuplicatePolicy != 2 {
+		return fmt.Errorf("invalid config: auth.phone_code.duplicate_policy must be 1 or 2")
 	}
 	if cfg.Auth.Password.BcryptCost <= 0 {
 		cfg.Auth.Password.BcryptCost = 12
@@ -204,6 +207,15 @@ func validate(cfg *Configuration) error {
 	}
 
 	return nil
+}
+
+func asciiDigits(value string) bool {
+	for _, digit := range value {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateCategorySeeds(seeds *CategorySeedFile) error {
