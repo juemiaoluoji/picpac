@@ -1,0 +1,151 @@
+name: Container image
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Match the k3s node architecture
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+        default: linux/amd64
+
+permissions:
+  contents: read
+
+env:
+  # Disable Docker's build-record artifact upload to avoid storage charges.
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+
+jobs:
+  image:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    # Configure required reviewers on this environment in repository settings.
+    # Keep each merge's approval independent; do not group waiting runs together.
+    environment: release-approval
+    runs-on: ubuntu-latest
+    # Allow slow TCR uploads up to GitHub's hosted-job limit.
+    timeout-minutes: 360
+    outputs:
+      image: ${{ steps.settings.outputs.image }}
+      platform: ${{ steps.settings.outputs.platform }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Select image
+        id: settings
+        env:
+          REQUEST_PLATFORM: ${{ inputs.platform || vars.TKE_PLATFORM || 'linux/amd64' }}
+          TCR_IMAGE: ${{ vars.TCR_IMAGE }}
+          TCR_USERNAME: ${{ secrets.TCR_USERNAME }}
+          TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$REQUEST_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) echo "::error::TKE_PLATFORM must be linux/amd64 or linux/arm64"; exit 1 ;;
+          esac
+
+          for value in TCR_IMAGE TCR_USERNAME TCR_PASSWORD; do
+            [[ -n "${!value}" ]] || { echo "::error::Missing repository configuration: $value"; exit 1; }
+          done
+          if [[ ! "$TCR_IMAGE" =~ ^[a-z0-9.-]+/[a-z0-9._-]+/[a-z0-9._-]+$ ]]; then
+            echo "::error::TCR_IMAGE must be registry/namespace/repository, without a tag or scheme"
+            exit 1
+          fi
+          registry="${TCR_IMAGE%%/*}"
+          image="${TCR_IMAGE}:${GITHUB_SHA:0:7}"
+          printf 'image=%s\nregistry=%s\nplatform=%s\n' \
+            "$image" "$registry" "$REQUEST_PLATFORM" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ steps.settings.outputs.platform }}
+          tags: ${{ steps.settings.outputs.image }}
+          load: true
+          push: false
+
+      - name: Verify image contents
+        id: verify
+        env:
+          IMAGE: ${{ steps.settings.outputs.image }}
+          PLATFORM: ${{ steps.settings.outputs.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")"
+          [[ "$actual_platform" == "$PLATFORM" ]]
+          [[ "$(docker image inspect --format '{{.Config.User}}' "$IMAGE")" == "10001:10001" ]]
+          printf 'size=%s\n' "$(docker image inspect --format '{{.Size}}' "$IMAGE")" >> "$GITHUB_OUTPUT"
+
+          container="$(docker create --platform "$PLATFORM" "$IMAGE")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker export "$container" --output "$RUNNER_TEMP/picpac-rootfs.tar"
+          tar -tf "$RUNNER_TEMP/picpac-rootfs.tar" > "$RUNNER_TEMP/picpac-rootfs.txt"
+          grep -qx 'app/picpac' "$RUNNER_TEMP/picpac-rootfs.txt"
+          grep -qx 'app/category.json' "$RUNNER_TEMP/picpac-rootfs.txt"
+          grep -qx 'etc/ssl/certs/ca-certificates.crt' "$RUNNER_TEMP/picpac-rootfs.txt"
+          if grep -Eq '(^|/)(config(\.prod)?\.json|\.git)(/|$)' "$RUNNER_TEMP/picpac-rootfs.txt"; then
+            echo "::error::Runtime configuration or Git metadata was included in the image"
+            exit 1
+          fi
+
+      - name: Log in to TCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ steps.settings.outputs.registry }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Push image
+        env:
+          IMAGE: ${{ steps.settings.outputs.image }}
+        run: docker push "$IMAGE"
+
+      - name: Write result
+        env:
+          IMAGE: ${{ steps.settings.outputs.image }}
+          PLATFORM: ${{ steps.settings.outputs.platform }}
+          IMAGE_SIZE: ${{ steps.verify.outputs.size }}
+        shell: bash
+        run: |
+          {
+            printf 'Image: `%s`\n\nPlatform: `%s`\n\n' "$IMAGE" "$PLATFORM"
+            printf 'Uncompressed image size: `%s bytes`\n\n' "$IMAGE_SIZE"
+            echo 'Published to TCR. The k3s deployment job follows automatically in this run.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: image
+    uses: ./.github/workflows/deploy-k3s.yml
+    with:
+      image: ${{ needs.image.outputs.image }}
+      platform: ${{ needs.image.outputs.platform }}
+    secrets: inherit

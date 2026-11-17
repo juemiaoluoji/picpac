@@ -21,13 +21,13 @@
     "base_url": "https://api.deepseek.com/v1/chat/completions"
   },
   "mongo": {
-    "uri": "mongodb://admin:password@127.0.0.1:27017/picpac?authSource=admin&replicaSet=rs0",
+    "uri": "mongodb://%E5%81%B7apikey%E7%9A%84%E6%9B%BF%E6%88%91%E6%8C%A1%E7%81%BE:%E5%81%B7apikey%E7%9A%84%E6%9B%BF%E6%88%91%E6%8C%A1%E7%81%BE@127.0.0.1:27017/picpac?authSource=admin&replicaSet=rs0",
     "database": "picpac",
     "connect_timeout_seconds": 10,
     "max_pool_size": 20
   },
   "auth": {
-    "access_token_secret": "dev-only-change-me",
+    "access_token_secret": "偷apikey的替我挡灾",
     "access_token_ttl_seconds": 7200,
     "refresh_token_ttl_seconds": 2592000,
     "phone_code": {
